@@ -628,8 +628,9 @@ function TransitionModal({ record, rt, toState, onDone, onClose }: {
   )
 }
 
-function RecordDetailView({ ref, catalog, onBack, onOpen, onChanged, onFilterCi }: {
-  ref: string
+// `recordRef`, not `ref`: React reserves the `ref` prop and a string there crashes the render.
+function RecordDetailView({ recordRef, catalog, onBack, onOpen, onChanged, onFilterCi }: {
+  recordRef: string
   catalog: Catalog | null
   onBack: () => void
   onOpen: (ref: string) => void
@@ -653,11 +654,11 @@ function RecordDetailView({ ref, catalog, onBack, onOpen, onChanged, onFilterCi 
   const load = useCallback(async () => {
     setError(null)
     try {
-      setRecord((await itsmApi.get(ref)).record)
+      setRecord((await itsmApi.get(recordRef)).record)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     }
-  }, [ref])
+  }, [recordRef])
   useEffect(() => { void load() }, [load])
 
   async function run(fn: () => Promise<unknown>) {
@@ -985,7 +986,7 @@ export default function PluginApp() {
       <StatsStrip stats={stats} catalog={catalog} />
       {view.kind === 'list' && <RecordList key={view.ci ?? ''} catalog={catalog} onOpen={open} initialCi={view.ci} />}
       {view.kind === 'create' && <CreateForm catalog={catalog} initialType={view.type} initialCi={view.ci} onCreated={open} onCancel={() => setView({ kind: 'list' })} />}
-      {view.kind === 'detail' && <RecordDetailView ref={view.ref} catalog={catalog} onBack={() => setView({ kind: 'list' })} onOpen={open} onChanged={refreshStats} onFilterCi={(ci) => setView({ kind: 'list', ci })} />}
+      {view.kind === 'detail' && <RecordDetailView recordRef={view.ref} catalog={catalog} onBack={() => setView({ kind: 'list' })} onOpen={open} onChanged={refreshStats} onFilterCi={(ci) => setView({ kind: 'list', ci })} />}
       {view.kind === 'catalog' && <CatalogView catalog={catalog} onBack={() => setView({ kind: 'list' })} onReload={async () => { setCatalog(await itsmApi.reloadCatalog()) }} />}
     </div>
   )
