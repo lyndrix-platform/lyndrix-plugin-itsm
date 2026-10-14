@@ -1,0 +1,106 @@
+# Change — addition, modification or removal of anything that could affect a
+# service. The approval *workflow* (who may approve, CAB) lands in a later
+# phase; the states and fields are already shaped for it so nothing moves.
+id: change
+label: Change
+prefix: CHG
+number_width: 7
+icon: published_with_changes
+mode: native
+description: Planned modification of infrastructure or an application.
+
+subtypes:
+  - {id: standard, label: Standard (pre-approved, low risk)}
+  - {id: normal, label: Normal (needs assessment & approval)}
+  - {id: emergency, label: Emergency (fix now, approve after)}
+
+categories:
+  - id: infrastructure
+    label: Infrastructure
+    children:
+      - {id: provisioning, label: Provisioning (new host / container)}
+      - {id: decommission, label: Decommission}
+      - {id: resize, label: Resize / hardware}
+  - id: deployment
+    label: Deployment
+    children:
+      - {id: service_update, label: Service update}
+      - {id: config, label: Configuration}
+  - id: network
+    label: Network
+  - id: security
+    label: Security / patching
+
+priority:
+  impact:
+    - {id: 1, label: High}
+    - {id: 2, label: Medium}
+    - {id: 3, label: Low}
+  urgency:
+    - {id: 1, label: High}
+    - {id: 2, label: Medium}
+    - {id: 3, label: Low}
+  defaults: {impact: 2, urgency: 3}
+  matrix:
+    "1-1": P1
+    "1-2": P2
+    "1-3": P2
+    "2-1": P2
+    "2-2": P3
+    "2-3": P3
+    "3-1": P3
+    "3-2": P4
+    "3-3": P4
+  levels:
+    - {id: P1, label: Critical, color: down}
+    - {id: P2, label: High, color: down}
+    - {id: P3, label: Medium, color: paused}
+    - {id: P4, label: Low, color: unknown}
+
+states:
+  - {id: new, label: New, initial: true, kind: open}
+  - {id: assess, label: Assessment, kind: open, requires: [risk, implementation_plan, rollback_plan]}
+  - {id: approval, label: Awaiting approval, kind: open, requires: [planned_start, planned_end]}
+  - {id: scheduled, label: Scheduled, kind: open}
+  - {id: implementing, label: Implementing, kind: open}
+  - {id: review, label: Post-implementation review, kind: open}
+  - {id: closed, label: Closed, kind: closed, final: true, requires: [close_code]}
+  - {id: cancelled, label: Cancelled, kind: closed, final: true, requires: [cancel_reason]}
+
+transitions:
+  new: [assess, cancelled]
+  assess: [approval, scheduled, cancelled]      # standard changes skip approval
+  approval: [scheduled, assess, cancelled]
+  scheduled: [implementing, cancelled]
+  implementing: [review, scheduled]
+  review: [closed]
+
+fields:
+  - id: risk
+    label: Risk
+    kind: select
+    options:
+      - {id: low, label: Low}
+      - {id: medium, label: Medium}
+      - {id: high, label: High}
+  - {id: planned_start, label: Planned start, kind: datetime}
+  - {id: planned_end, label: Planned end, kind: datetime}
+  - {id: implementation_plan, label: Implementation plan, kind: text, multiline: true}
+  - {id: rollback_plan, label: Rollback plan, kind: text, multiline: true}
+  - {id: test_plan, label: Test plan, kind: text, multiline: true}
+  - {id: approval_notes, label: Approval notes, kind: text, multiline: true}
+  - id: close_code
+    label: Close code
+    kind: select
+    options:
+      - {id: successful, label: Successful}
+      - {id: successful_with_issues, label: Successful with issues}
+      - {id: rolled_back, label: Rolled back}
+      - {id: failed, label: Failed}
+  - {id: cancel_reason, label: Cancel reason, kind: text}
+  # Set by the IaC change bridge (later phase): which pipeline/plan this covers.
+  - {id: iac_plan_ref, label: IaC plan reference, kind: text}
+
+assignment_groups:
+  - {id: infra, label: Infrastructure, core_group: INT_ADMIN}
+  - {id: cab, label: Change Advisory Board}

@@ -1,0 +1,116 @@
+{
+  "title": "Service Management",
+  "subtitle": "Incidents, changes, problems and requests — one process engine, defined in the catalog.",
+  "common": {
+    "back": "Back",
+    "cancel": "Cancel",
+    "save": "Save",
+    "edit": "Edit",
+    "add": "Add",
+    "refresh": "Refresh"
+  },
+  "stats": {
+    "open_one": "{{count}} open",
+    "open_other": "{{count}} open",
+    "total_one": "{{count}} total",
+    "total_other": "{{count}} total"
+  },
+  "field": {
+    "number": "Number",
+    "title": "Title",
+    "description": "Description",
+    "type": "Type",
+    "subtype": "Subtype",
+    "category": "Category",
+    "state": "State",
+    "priority": "Prio",
+    "impact": "Impact",
+    "urgency": "Urgency",
+    "assignment_group": "Assignment group",
+    "assignee": "Assignee",
+    "requester": "Requester",
+    "tags": "Tags (comma separated)",
+    "opened": "Opened",
+    "resolved": "Resolved",
+    "closed": "Closed",
+    "version": "Version"
+  },
+  "list": {
+    "searchPlaceholder": "Search number or title…",
+    "allTypes": "All types",
+    "allStates": "All states",
+    "allPriorities": "All priorities",
+    "includeClosed": "include closed",
+    "empty": "No records match.",
+    "shown": "{{shown}} of {{total}}"
+  },
+  "create": {
+    "new": "New record",
+    "title": "New record",
+    "submit": "Create",
+    "customFields": "Additional fields",
+    "derivedPriority": "Priority: {{p}}",
+    "requesterHint": "defaults to you"
+  },
+  "detail": {
+    "details": "Details"
+  },
+  "transition": {
+    "title": "{{number}} → {{state}}",
+    "requires": "This state requires:",
+    "note": "Note (journal)"
+  },
+  "journal": {
+    "title": "Timeline",
+    "placeholder": "Add to the timeline…",
+    "add": "Add",
+    "kind": {
+      "comment": "Comment",
+      "work_note": "Work note",
+      "state_change": "State change",
+      "field_change": "Field change",
+      "link": "Link",
+      "attachment": "Attachment",
+      "system": "System"
+    }
+  },
+  "ci": {
+    "title": "Configuration items",
+    "searchPlaceholder": "Search the Entity Registry or paste a UUID…",
+    "role": {
+      "affected": "affected",
+      "caused_by": "caused by",
+      "changed": "changed",
+      "related": "related"
+    }
+  },
+  "links": {
+    "title": "Related records",
+    "placeholder": "INC0000042",
+    "rel": {
+      "parent_of": "parent of",
+      "child_of": "child of",
+      "caused_by": "caused by",
+      "causes": "causes",
+      "implements": "implements",
+      "implemented_by": "implemented by",
+      "duplicate_of": "duplicate of",
+      "duplicates": "duplicates",
+      "related_to": "related to"
+    }
+  },
+  "attachments": {
+    "title": "Attachments",
+    "upload": "Upload"
+  },
+  "catalog": {
+    "title": "Process catalog",
+    "reload": "Reload from disk",
+    "hint": "Record types are defined in catalog/record_types/*.yml. Edit the YAML (or point the plugin at your own catalog dir in its settings) and reload.",
+    "state": "State",
+    "kind": "Kind",
+    "transitions": "Transitions to",
+    "requires": "Requires",
+    "summary": "{{subtypes}} subtypes · {{fields}} custom fields · {{groups}} groups"
+  }
+}

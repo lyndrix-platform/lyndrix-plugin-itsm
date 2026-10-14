@@ -1,0 +1,114 @@
+# Incident — unplanned interruption or degradation of a service (ITIL 4).
+#
+# Record types are configuration: states, transitions, required fields,
+# subtypes, categories and the priority matrix all live here. Adding a state
+# or a custom field needs no code. See documentation.md for the schema.
+id: incident
+label: Incident
+prefix: INC
+number_width: 7
+icon: report_problem
+mode: native            # native | gateway:<connector id>  (system of record)
+description: Unplanned interruption to, or reduction in the quality of, a service.
+
+subtypes:
+  - {id: outage, label: Outage}
+  - {id: degradation, label: Degradation}
+  - {id: security, label: Security incident}
+  - {id: data, label: Data issue}
+
+categories:
+  - id: compute
+    label: Compute
+    children:
+      - {id: hypervisor, label: Hypervisor}
+      - {id: vm, label: Virtual machine}
+      - {id: container, label: Container}
+  - id: network
+    label: Network
+    children:
+      - {id: dns, label: DNS}
+      - {id: dhcp, label: DHCP}
+      - {id: routing, label: Routing / firewall}
+      - {id: vpn, label: VPN}
+  - id: storage
+    label: Storage
+  - id: application
+    label: Application
+  - id: identity
+    label: Identity & access
+  - id: monitoring
+    label: Monitoring / alerting
+
+priority:
+  impact:
+    - {id: 1, label: High — many users / critical service}
+    - {id: 2, label: Medium — a team or a non-critical service}
+    - {id: 3, label: Low — single user / cosmetic}
+  urgency:
+    - {id: 1, label: High — work is blocked now}
+    - {id: 2, label: Medium — workaround exists}
+    - {id: 3, label: Low — can wait}
+  defaults: {impact: 3, urgency: 3}
+  # "<impact>-<urgency>" → priority level
+  matrix:
+    "1-1": P1
+    "1-2": P2
+    "1-3": P3
+    "2-1": P2
+    "2-2": P3
+    "2-3": P4
+    "3-1": P3
+    "3-2": P4
+    "3-3": P4
+  levels:
+    - {id: P1, label: Critical, color: down}
+    - {id: P2, label: High, color: down}
+    - {id: P3, label: Medium, color: paused}
+    - {id: P4, label: Low, color: unknown}
+
+# kind: open | resolved | closed — drives resolved_at/closed_at and the
+# "open records" filters. Exactly one state has initial: true.
+states:
+  - {id: new, label: New, initial: true, kind: open}
+  - {id: in_progress, label: In progress, kind: open}
+  - {id: on_hold, label: On hold, kind: open, requires: [hold_reason]}
+  - {id: resolved, label: Resolved, kind: resolved, requires: [resolution_code, resolution_notes]}
+  - {id: closed, label: Closed, kind: closed, final: true}
+  - {id: cancelled, label: Cancelled, kind: closed, final: true, requires: [cancel_reason]}
+
+transitions:
+  new: [in_progress, resolved, cancelled]
+  in_progress: [on_hold, resolved, cancelled]
+  on_hold: [in_progress, cancelled]
+  resolved: [closed, in_progress]
+
+# Custom fields → stored in custom_fields JSON, validated against kind.
+# kind: text | select | int | bool | datetime
+fields:
+  - id: hold_reason
+    label: Hold reason
+    kind: select
+    options:
+      - {id: awaiting_user, label: Awaiting user}
+      - {id: awaiting_vendor, label: Awaiting vendor}
+      - {id: awaiting_change, label: Awaiting change}
+  - id: resolution_code
+    label: Resolution code
+    kind: select
+    options:
+      - {id: fixed, label: Fixed}
+      - {id: workaround, label: Workaround applied}
+      - {id: no_fault_found, label: No fault found}
+      - {id: duplicate, label: Duplicate}
+      - {id: cannot_reproduce, label: Cannot reproduce}
+  - {id: resolution_notes, label: Resolution notes, kind: text, multiline: true}
+  - {id: cancel_reason, label: Cancel reason, kind: text}
+  - {id: affected_users, label: Affected users (count), kind: int}
+  - {id: security_relevant, label: Security relevant, kind: bool}
+
+assignment_groups:
+  - {id: service_desk, label: Service Desk}
+  - {id: infra, label: Infrastructure, core_group: INT_ADMIN}
+  - {id: network, label: Network}
+  - {id: security, label: Security}

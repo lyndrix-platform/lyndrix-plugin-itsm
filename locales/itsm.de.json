@@ -1,0 +1,116 @@
+{
+  "title": "Service Management",
+  "subtitle": "Incidents, Changes, Probleme und Anfragen — eine Prozess-Engine, definiert im Katalog.",
+  "common": {
+    "back": "Zurück",
+    "cancel": "Abbrechen",
+    "save": "Speichern",
+    "edit": "Bearbeiten",
+    "add": "Hinzufügen",
+    "refresh": "Aktualisieren"
+  },
+  "stats": {
+    "open_one": "{{count}} offen",
+    "open_other": "{{count}} offen",
+    "total_one": "{{count}} gesamt",
+    "total_other": "{{count}} gesamt"
+  },
+  "field": {
+    "number": "Nummer",
+    "title": "Titel",
+    "description": "Beschreibung",
+    "type": "Typ",
+    "subtype": "Untertyp",
+    "category": "Kategorie",
+    "state": "Status",
+    "priority": "Prio",
+    "impact": "Auswirkung",
+    "urgency": "Dringlichkeit",
+    "assignment_group": "Bearbeitergruppe",
+    "assignee": "Bearbeiter",
+    "requester": "Melder",
+    "tags": "Tags (kommagetrennt)",
+    "opened": "Eröffnet",
+    "resolved": "Gelöst",
+    "closed": "Geschlossen",
+    "version": "Version"
+  },
+  "list": {
+    "searchPlaceholder": "Nummer oder Titel suchen…",
+    "allTypes": "Alle Typen",
+    "allStates": "Alle Status",
+    "allPriorities": "Alle Prioritäten",
+    "includeClosed": "geschlossene einblenden",
+    "empty": "Keine passenden Datensätze.",
+    "shown": "{{shown}} von {{total}}"
+  },
+  "create": {
+    "new": "Neuer Datensatz",
+    "title": "Neuer Datensatz",
+    "submit": "Anlegen",
+    "customFields": "Weitere Felder",
+    "derivedPriority": "Priorität: {{p}}",
+    "requesterHint": "Standard: du selbst"
+  },
+  "detail": {
+    "details": "Details"
+  },
+  "transition": {
+    "title": "{{number}} → {{state}}",
+    "requires": "Dieser Status erfordert:",
+    "note": "Notiz (Verlauf)"
+  },
+  "journal": {
+    "title": "Verlauf",
+    "placeholder": "Zum Verlauf hinzufügen…",
+    "add": "Hinzufügen",
+    "kind": {
+      "comment": "Kommentar",
+      "work_note": "Arbeitsnotiz",
+      "state_change": "Statuswechsel",
+      "field_change": "Feldänderung",
+      "link": "Verknüpfung",
+      "attachment": "Anhang",
+      "system": "System"
+    }
+  },
+  "ci": {
+    "title": "Configuration Items",
+    "searchPlaceholder": "Entity Registry durchsuchen oder UUID einfügen…",
+    "role": {
+      "affected": "betroffen",
+      "caused_by": "verursacht durch",
+      "changed": "geändert",
+      "related": "verwandt"
+    }
+  },
+  "links": {
+    "title": "Verknüpfte Datensätze",
+    "placeholder": "INC0000042",
+    "rel": {
+      "parent_of": "übergeordnet zu",
+      "child_of": "untergeordnet zu",
+      "caused_by": "verursacht durch",
+      "causes": "verursacht",
+      "implements": "setzt um",
+      "implemented_by": "umgesetzt durch",
+      "duplicate_of": "Duplikat von",
+      "duplicates": "dupliziert",
+      "related_to": "verwandt mit"
+    }
+  },
+  "attachments": {
+    "title": "Anhänge",
+    "upload": "Hochladen"
+  },
+  "catalog": {
+    "title": "Prozesskatalog",
+    "reload": "Von der Platte neu laden",
+    "hint": "Datensatztypen sind in catalog/record_types/*.yml definiert. YAML anpassen (oder in den Plugin-Einstellungen ein eigenes Katalogverzeichnis setzen) und neu laden.",
+    "state": "Status",
+    "kind": "Art",
+    "transitions": "Übergänge nach",
+    "requires": "Erfordert",
+    "summary": "{{subtypes}} Untertypen · {{fields}} Zusatzfelder · {{groups}} Gruppen"
+  }
+}
