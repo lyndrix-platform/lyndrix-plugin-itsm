@@ -125,6 +125,10 @@ Basis: `/api/plugins/lyndrix.plugin.itsm/`. Rechte: `plugin:lyndrix.plugin.itsm:
 Fehlercodes: 400 ungültige Eingabe / fehlende Pflichtfelder, 404 unbekannt, 409 unerlaubter
 Übergang oder veraltete `version`, 503 Datenbank noch nicht bereit.
 
+`source`/`external_id` beim Anlegen (Gateway-Schlüssel eines externen Systems) dürfen nur
+Administratoren bzw. Connectoren mit `itsm:admin` setzen — ein Agent kann sich so nicht als BMC
+ausgeben (sonst 403).
+
 ## Event-Bus
 
 ### Konsumiert

@@ -140,6 +140,14 @@ def build_plugin_router(service: ItsmService) -> APIRouter:
         payload: RecordCreate, identity: ApiIdentity = Depends(require_permission(PERM_WRITE))
     ):
         _ensure_ready()
+        # source/external_id mark a record as owned by an external system of
+        # record (gateway mode). Only administrators (or connectors running as
+        # the system key) may claim that — an agent must not impersonate BMC.
+        if (payload.source or payload.external_id) and not identity.allows(PERM_ADMIN):
+            raise HTTPException(
+                status_code=403,
+                detail="Setting source/external_id requires the itsm:admin permission.",
+            )
         data = payload.model_dump(exclude_unset=True)
         data["ci_links"] = [c.model_dump() for c in payload.ci_links]
         record = await _call(service.create_record, data, author=identity.username)
