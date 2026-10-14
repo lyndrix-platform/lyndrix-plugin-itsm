@@ -12,6 +12,8 @@ itsm:state_changed    — {record, from_state, to_state}
 itsm:journal_added    — {record_uuid, number, entry}
 entity_registry:register — every new record is announced as an itsm_record
                             entity (fire-and-forget; works without the registry)
+entity_registry:lookup   — request (via ctx.request) to resolve a CI reference
+                            for a CI link; reply on entity_registry:lookup_result
 """
 from __future__ import annotations
 
@@ -500,6 +502,82 @@ class ItsmService:
             out.append({"entity_uuid": raw["entity_uuid"], "role": role,
                         "display_name": raw.get("display_name"), "entity_type": raw.get("entity_type")})
         return out
+
+    # ── CI resolution (Entity Registry — optional, degrades gracefully) ──────
+
+    async def resolve_ci(self, ref: str, *, timeout: float = 5.0) -> dict | None:
+        """Ask the Entity Registry which configuration item ``ref`` means.
+
+        ``ref`` is anything the registry resolves: a UUID (merged tombstones are
+        followed to the surviving CI), ``scheme:value``, a bare identifier value
+        such as ``docker-hydra`` or a display name.
+
+        Returns a link stub ``{entity_uuid, display_name, entity_type}``.
+        Raises ItsmError when the registry answered but knows no such CI (near
+        misses are named in the message). Returns None when the registry is
+        not available (plugin absent, no ``ctx.request`` on an old core, timeout)
+        — the caller decides how to degrade.
+        """
+        ctx = self._ctx
+        if ctx is None or not hasattr(ctx, "request"):
+            return None
+        try:
+            reply = await ctx.request(
+                "entity_registry:lookup", {"ref": str(ref)},
+                reply_topic="entity_registry:lookup_result", timeout=timeout,
+            )
+        except Exception as exc:  # missing permission, bus failure → registry "absent"
+            log.debug(f"ITSM: registry lookup for '{ref}' failed — {exc}")
+            return None
+        if not reply or not reply.get("ok"):
+            return None
+        entity = reply.get("entity")
+        if not entity:
+            # ITSM records are registry entities too; they are never CIs here.
+            cands = [c for c in (reply.get("candidates") or []) if c.get("entity_type") != "itsm_record"]
+            hint = ", ".join(
+                f"{c.get('display_name')} [{c.get('entity_type')}] {str(c.get('uuid'))[:8]}…"
+                for c in cands[:5]
+            )
+            what = "is ambiguous" if reply.get("match") == "ambiguous" else "is unknown to the Entity Registry"
+            raise ItsmError(f"CI '{ref}' {what}" + (f" — candidates: {hint}" if hint else ""))
+        if entity.get("entity_type") == "itsm_record":
+            raise ItsmError(
+                f"'{ref}' is an ITSM record, not a configuration item — relate records via record links"
+            )
+        return {"entity_uuid": entity["uuid"], "display_name": entity.get("display_name"),
+                "entity_type": entity.get("entity_type")}
+
+    async def resolve_ci_links(self, links: list) -> list[dict]:
+        """Normalise CI link inputs into validated link dicts.
+
+        Each entry carries ``entity_uuid`` and/or ``ci`` (any ref the registry
+        resolves) plus ``role``. The registry is consulted for every entry so
+        names are cached from the source of truth, typos are rejected and
+        merged UUIDs are re-pointed. Without the registry a raw UUID still links
+        (with whatever name the caller supplied); a name alone cannot.
+        """
+        out: list[dict] = []
+        for raw in links or []:
+            if not isinstance(raw, dict):
+                raise ItsmError("ci_links entries must be objects")
+            uuid = str(raw.get("entity_uuid") or "").strip()
+            ci_ref = str(raw.get("ci") or raw.get("ref") or "").strip()
+            if not uuid and not ci_ref:
+                raise ItsmError("ci_links entries need an entity_uuid or a ci reference")
+            link = {"entity_uuid": uuid, "role": raw.get("role") or "affected",
+                    "display_name": raw.get("display_name"), "entity_type": raw.get("entity_type")}
+            resolved = await self.resolve_ci(uuid or ci_ref)
+            if resolved is not None:
+                link["entity_uuid"] = resolved["entity_uuid"]
+                link["display_name"] = resolved["display_name"] or link["display_name"]
+                link["entity_type"] = resolved["entity_type"] or link["entity_type"]
+            elif not uuid:
+                raise ItsmError(
+                    f"Cannot resolve CI '{ci_ref}': the Entity Registry is not available — link by UUID instead"
+                )
+            out.append(link)
+        return self._check_ci_links(out)
 
     def link_ci(self, ref: str, entity_uuid: str, role: str = "affected", *,
                 display_name: str | None = None, entity_type: str | None = None,

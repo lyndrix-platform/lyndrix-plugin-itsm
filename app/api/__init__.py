@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from core.api import ApiIdentity, require_permission
 
@@ -28,10 +28,20 @@ PERM_ADMIN = f"plugin:{PLUGIN_ID}:itsm:admin"
 # ── Payloads ───────────────────────────────────────────────────────────────────
 
 class CiLinkIn(BaseModel):
-    entity_uuid: str = Field(min_length=36, max_length=36)
+    """A configuration item to link. Give the registry UUID, or ``ci`` — any
+    reference the Entity Registry resolves (UUID, ``iac.host:docker-hydra``,
+    a bare identifier value like ``docker-hydra`` or a display name)."""
+    entity_uuid: Optional[str] = Field(default=None, min_length=36, max_length=36)
+    ci: Optional[str] = Field(default=None, min_length=1, max_length=255)
     role: str = "affected"
     display_name: Optional[str] = None
     entity_type: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _uuid_or_ci(self) -> "CiLinkIn":
+        if not self.entity_uuid and not self.ci:
+            raise ValueError("entity_uuid or ci is required")
+        return self
 
 
 class RecordCreate(BaseModel):
@@ -112,6 +122,13 @@ def build_plugin_router(service: ItsmService) -> APIRouter:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             raise
 
+    async def _ci_links(items: List[CiLinkIn]) -> List[dict]:
+        """Resolve CI references through the Entity Registry (same error mapping)."""
+        try:
+            return await service.resolve_ci_links([c.model_dump() for c in items])
+        except ItsmError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     # ── Records ────────────────────────────────────────────────────────────────
     @router.get("/records")
     async def list_records(
@@ -149,7 +166,7 @@ def build_plugin_router(service: ItsmService) -> APIRouter:
                 detail="Setting source/external_id requires the itsm:admin permission.",
             )
         data = payload.model_dump(exclude_unset=True)
-        data["ci_links"] = [c.model_dump() for c in payload.ci_links]
+        data["ci_links"] = await _ci_links(payload.ci_links)
         record = await _call(service.create_record, data, author=identity.username)
         return {"record": record}
 
@@ -198,9 +215,10 @@ def build_plugin_router(service: ItsmService) -> APIRouter:
         ref: str, payload: CiLinkIn, identity: ApiIdentity = Depends(require_permission(PERM_WRITE))
     ):
         _ensure_ready()
+        link = (await _ci_links([payload]))[0]
         record = await _call(
-            service.link_ci, ref, payload.entity_uuid, payload.role,
-            display_name=payload.display_name, entity_type=payload.entity_type, author=identity.username,
+            service.link_ci, ref, link["entity_uuid"], link["role"],
+            display_name=link["display_name"], entity_type=link["entity_type"], author=identity.username,
         )
         return {"record": record}
 

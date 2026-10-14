@@ -42,7 +42,9 @@
     "allPriorities": "All priorities",
     "includeClosed": "include closed",
     "empty": "No records match.",
-    "shown": "{{shown}} of {{total}}"
+    "shown": "{{shown}} of {{total}}",
+    "ciFilter": "Configuration item",
+    "ciFilterClear": "Remove CI filter"
   },
   "create": {
     "new": "New record",
@@ -50,7 +52,8 @@
     "submit": "Create",
     "customFields": "Additional fields",
     "derivedPriority": "Priority: {{p}}",
-    "requesterHint": "defaults to you"
+    "requesterHint": "defaults to you",
+    "forCi": "for configuration item"
   },
   "detail": {
     "details": "Details"
@@ -82,7 +85,16 @@
       "caused_by": "caused by",
       "changed": "changed",
       "related": "related"
-    }
+    },
+    "unknownUuid": "No configuration item with this UUID in the Entity Registry.",
+    "noMatch": "No matching configuration item in the Entity Registry.",
+    "addAnyway": "Link UUID anyway",
+    "registryUnavailable": "Entity Registry not reachable — you can still link a raw UUID.",
+    "alreadyLinked": "already linked",
+    "recordsForCi": "Show all records for this configuration item",
+    "resolving": "Resolving configuration item…",
+    "notFound": "Configuration item {{ref}} was not found in the Entity Registry.",
+    "searchHint": "Type a name (e.g. docker-hydra), an identifier or a UUID — pick a result to link it."
   },
   "links": {
     "title": "Related records",

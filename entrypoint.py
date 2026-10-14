@@ -25,6 +25,10 @@ Events consumed
   itsm:transition     — {ref, to_state, fields?, note?, author, version?, request_id?}
                         → reply on itsm:transition_result
   itsm:journal_add    — {ref, kind, body, author}
+  itsm:ci_link        — {ref, ci | entity_uuid, role?, author, request_id?}
+                        → reply on itsm:ci_link_result {request_id, ok, record, ci}
+                        ``ci`` is any reference the Entity Registry resolves
+                        (UUID, scheme:value, 'docker-hydra', display name).
   Use ctx.request() for the round-trips; failures without a request_id are
   reported on itsm:ingest_failed.
 
@@ -33,6 +37,8 @@ Events emitted
   itsm:record_created / itsm:record_updated / itsm:state_changed /
   itsm:journal_added  — broadcasts (see app/logic/service.py)
   entity_registry:register — every new record becomes an itsm_record entity
+  entity_registry:lookup   — request to resolve CI references for links
+                             (reply: entity_registry:lookup_result)
 """
 import asyncio
 import time
@@ -90,6 +96,9 @@ manifest = ModuleManifest(
             "itsm:record_update",
             "itsm:transition",
             "itsm:journal_add",
+            "itsm:ci_link",
+            # Reply topic of our entity_registry:lookup requests.
+            "entity_registry:lookup_result",
             # Own broadcasts, consumed for notification routing.
             "itsm:record_updated",
             "itsm:state_changed",
@@ -103,8 +112,10 @@ manifest = ModuleManifest(
             "itsm:record_create_result",
             "itsm:record_update_result",
             "itsm:transition_result",
+            "itsm:ci_link_result",
             "itsm:ingest_failed",
             "entity_registry:register",
+            "entity_registry:lookup",
         ],
     },
     notification_endpoints=[
@@ -254,11 +265,38 @@ def setup(ctx):
             body = {k: v for k, v in data.items() if k not in ("request_id", "author")}
             payload_model = RecordCreate.model_validate(body)
             rec_data = payload_model.model_dump(exclude_unset=True)
-            rec_data["ci_links"] = [c.model_dump() for c in payload_model.ci_links]
+            rec_data["ci_links"] = await svc.resolve_ci_links([c.model_dump() for c in payload_model.ci_links])
             record = await asyncio.to_thread(svc.create_record, rec_data, author=author)
             _reply("itsm:record_create_result", request_id, ok=True, record=record)
         except Exception as exc:
             _reply("itsm:record_create_result", request_id, ok=False, error=str(exc))
+
+    @ctx.subscribe("itsm:ci_link")
+    async def _on_ci_link(payload):
+        """Attach a configuration item to an existing record (event management,
+        connectors). ``ci`` may be a name — the Entity Registry resolves it."""
+        data = payload if isinstance(payload, dict) else {}
+        request_id = data.get("request_id")
+        if not svc.is_ready or not data.get("ref") or not (data.get("ci") or data.get("entity_uuid")):
+            _reply("itsm:ci_link_result", request_id, ok=False, error="ref and ci required / DB ready")
+            return
+        try:
+            link = (await svc.resolve_ci_links([{
+                "ci": data.get("ci"), "entity_uuid": data.get("entity_uuid"),
+                "role": data.get("role") or "affected",
+                "display_name": data.get("display_name"), "entity_type": data.get("entity_type"),
+            }]))[0]
+            record = await asyncio.to_thread(
+                svc.link_ci, str(data["ref"]), link["entity_uuid"], link["role"],
+                display_name=link["display_name"], entity_type=link["entity_type"],
+                author=str(data.get("author") or "bus"),
+            )
+            _reply("itsm:ci_link_result", request_id, ok=True, record=record, ci=link)
+        except _DOMAIN_ERRORS as exc:
+            _reply("itsm:ci_link_result", request_id, ok=False, error=str(exc))
+        except Exception as exc:
+            ctx.log.error(f"ITSM: ci_link failed — {exc}")
+            _reply("itsm:ci_link_result", request_id, ok=False, error="internal error")
 
     @ctx.subscribe("itsm:record_update")
     async def _on_record_update(payload):

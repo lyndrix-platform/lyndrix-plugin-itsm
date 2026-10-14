@@ -326,3 +326,99 @@ def test_get_by_number_and_unknown(svc):
     rec = _inc(svc)
     assert svc.get_record("INC0000001")["uuid"] == rec["uuid"]
     assert svc.get_record("INC9999999") is None
+
+
+# ── CI resolution through the Entity Registry ─────────────────────────────────
+
+import asyncio  # noqa: E402
+
+HYDRA = "60c443da-a68e-4ba2-8925-aa934ca5dca0"
+MERGED_AWAY = "11111111-1111-1111-1111-111111111111"
+
+
+class _RegistryCtx(_FakeCtx):
+    """Fake ctx.request answering like the Entity Registry's lookup handler."""
+
+    def __init__(self, known: dict[str, dict] | None = None, available: bool = True) -> None:
+        super().__init__()
+        self.known = known or {}
+        self.available = available
+        self.requests: list[tuple[str, dict]] = []
+
+    async def request(self, topic, payload, *, reply_topic, timeout=10.0):
+        self.requests.append((topic, payload))
+        if not self.available:
+            return None  # nobody answered within the timeout
+        ref = payload["ref"]
+        hit = self.known.get(ref) or self.known.get(ref.lower())
+        if hit:
+            return {"ok": True, "entity": hit, "match": "identifier", "candidates": []}
+        cands = [e for k, e in self.known.items() if ref.lower() in k.lower()]
+        return {"ok": True, "entity": None, "match": "ambiguous" if len(cands) > 1 else None,
+                "candidates": cands}
+
+
+def _registry(svc, available=True):
+    hydra = {"uuid": HYDRA, "entity_type": "host", "display_name": "docker-hydra"}
+    ctx = _RegistryCtx({"docker-hydra": hydra, HYDRA: hydra, "iac.host:docker-hydra": hydra,
+                        MERGED_AWAY: hydra,
+                        "docker-atlas": {"uuid": "a" * 8 + "-0000-0000-0000-" + "0" * 12,
+                                         "entity_type": "host", "display_name": "docker-atlas"}},
+                      available=available)
+    svc.set_context(ctx)
+    return ctx
+
+
+def test_resolve_ci_links_by_name_fills_uuid_and_cache(svc):
+    _registry(svc)
+    links = asyncio.run(svc.resolve_ci_links([{"ci": "docker-hydra", "role": "caused_by"}]))
+    assert links == [{"entity_uuid": HYDRA, "role": "caused_by",
+                      "display_name": "docker-hydra", "entity_type": "host"}]
+
+
+def test_resolve_ci_links_validates_uuid_and_repoints_merged(svc):
+    ctx = _registry(svc)
+    links = asyncio.run(svc.resolve_ci_links([{"entity_uuid": MERGED_AWAY}]))
+    assert links[0]["entity_uuid"] == HYDRA and links[0]["display_name"] == "docker-hydra"
+    assert ctx.requests[-1][0] == "entity_registry:lookup"
+    from app.logic.service import ItsmError
+    with pytest.raises(ItsmError, match="unknown to the Entity Registry"):
+        asyncio.run(svc.resolve_ci_links([{"entity_uuid": "99999999-9999-9999-9999-999999999999"}]))
+    with pytest.raises(ItsmError, match="candidates: docker-hydra"):
+        asyncio.run(svc.resolve_ci_links([{"ci": "docker-hyd"}]))
+    with pytest.raises(ItsmError, match="ambiguous"):
+        asyncio.run(svc.resolve_ci_links([{"ci": "docker-"}]))
+    # Records live in the registry too (itsm_record) but are never CIs — and
+    # never pollute the candidate hint.
+    ctx.known["INC0000001"] = {"uuid": "c" * 8 + "-0000-0000-0000-" + "0" * 12,
+                               "entity_type": "itsm_record", "display_name": "INC0000001 docker-hydra down"}
+    with pytest.raises(ItsmError, match="is an ITSM record"):
+        asyncio.run(svc.resolve_ci_links([{"ci": "INC0000001"}]))
+    with pytest.raises(ItsmError) as exc:
+        asyncio.run(svc.resolve_ci_links([{"ci": "docker-hyd"}]))
+    assert "itsm_record" not in str(exc.value) and "docker-hydra [host]" in str(exc.value)
+
+
+def test_resolve_ci_links_degrades_without_registry(svc):
+    from app.logic.service import ItsmError
+    _registry(svc, available=False)
+    links = asyncio.run(svc.resolve_ci_links([{"entity_uuid": HYDRA, "display_name": "hydra?"}]))
+    assert links[0] == {"entity_uuid": HYDRA, "role": "affected", "display_name": "hydra?", "entity_type": None}
+    with pytest.raises(ItsmError, match="not available"):
+        asyncio.run(svc.resolve_ci_links([{"ci": "docker-hydra"}]))
+    svc.set_context(_FakeCtx())  # core API < 1.4: no ctx.request at all
+    assert asyncio.run(svc.resolve_ci_links([{"entity_uuid": HYDRA}]))[0]["entity_uuid"] == HYDRA
+    with pytest.raises(ItsmError):
+        asyncio.run(svc.resolve_ci_links([{"role": "affected"}]))
+
+
+def test_create_and_link_with_resolved_ci(svc):
+    _registry(svc)
+    links = asyncio.run(svc.resolve_ci_links([{"ci": "docker-hydra"}]))
+    rec = svc.create_record({"record_type": "incident", "title": "hydra down", "ci_links": links}, author="m")
+    assert rec["ci_links"][0]["entity_uuid"] == HYDRA and rec["ci_links"][0]["display_name"] == "docker-hydra"
+    link = asyncio.run(svc.resolve_ci_links([{"ci": "iac.host:docker-hydra", "role": "changed"}]))[0]
+    rec = svc.link_ci(rec["uuid"], link["entity_uuid"], link["role"], display_name=link["display_name"],
+                      entity_type=link["entity_type"], author="m")
+    assert {(c["entity_uuid"], c["role"]) for c in rec["ci_links"]} == {(HYDRA, "affected"), (HYDRA, "changed")}
+    assert svc.list_records(ci=HYDRA)["total"] == 1

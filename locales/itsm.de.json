@@ -42,7 +42,9 @@
     "allPriorities": "Alle Prioritäten",
     "includeClosed": "geschlossene einblenden",
     "empty": "Keine passenden Datensätze.",
-    "shown": "{{shown}} von {{total}}"
+    "shown": "{{shown}} von {{total}}",
+    "ciFilter": "Configuration Item",
+    "ciFilterClear": "CI-Filter entfernen"
   },
   "create": {
     "new": "Neuer Datensatz",
@@ -50,7 +52,8 @@
     "submit": "Anlegen",
     "customFields": "Weitere Felder",
     "derivedPriority": "Priorität: {{p}}",
-    "requesterHint": "Standard: du selbst"
+    "requesterHint": "Standard: du selbst",
+    "forCi": "für Configuration Item"
   },
   "detail": {
     "details": "Details"
@@ -82,7 +85,16 @@
       "caused_by": "verursacht durch",
       "changed": "geändert",
       "related": "verwandt"
-    }
+    },
+    "unknownUuid": "Kein Configuration Item mit dieser UUID in der Entity Registry.",
+    "noMatch": "Kein passendes Configuration Item in der Entity Registry.",
+    "addAnyway": "UUID trotzdem verknüpfen",
+    "registryUnavailable": "Entity Registry nicht erreichbar — eine rohe UUID kann trotzdem verknüpft werden.",
+    "alreadyLinked": "bereits verknüpft",
+    "recordsForCi": "Alle Datensätze zu diesem Configuration Item anzeigen",
+    "resolving": "Configuration Item wird aufgelöst…",
+    "notFound": "Configuration Item {{ref}} wurde in der Entity Registry nicht gefunden.",
+    "searchHint": "Name (z. B. docker-hydra), Identifier oder UUID eingeben — Treffer anklicken, um zu verknüpfen."
   },
   "links": {
     "title": "Verknüpfte Datensätze",

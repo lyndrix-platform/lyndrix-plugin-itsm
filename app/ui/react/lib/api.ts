@@ -256,5 +256,18 @@ export const registryApi = {
       return []
     }
   },
+  /** One entity by UUID. `available: false` means the registry could not be
+   *  asked (absent, no permission, network) — degrade; `entity: null` with
+   *  `available: true` means the UUID is simply unknown. */
+  get: async (uuid: string): Promise<{ entity: RegistryEntity | null; available: boolean }> => {
+    try {
+      const res = await apiJson<{ entity: RegistryEntity }>(`/api/plugins/${REGISTRY_ID}/entities/${encodeURIComponent(uuid)}`)
+      return { entity: res.entity, available: true }
+    } catch (err) {
+      return { entity: null, available: (err as { status?: number }).status === 404 }
+    }
+  },
   deepLink: (uuid: string) => `/apps/lyndrix-plugin-entity_registry/registry?uuid=${encodeURIComponent(uuid)}`,
 }
+
+export const isUuid = (s: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s.trim())

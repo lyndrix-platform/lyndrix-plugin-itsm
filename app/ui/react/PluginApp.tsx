@@ -2,7 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 // Provided by the host shell (window.__lyndrix_react_i18next); strings come
 // from locales/itsm.<locale>.json (namespace "itsm").
 import { useTranslation } from 'react-i18next'
-import { itsmApi, registryApi } from './lib/api'
+import { isUuid, itsmApi, registryApi } from './lib/api'
 import type {
   AttachmentMeta, Catalog, FieldDef, RecordDetail, RecordSummary, RecordTypeDef, RegistryEntity, Stats,
 } from './lib/api'
@@ -145,37 +145,92 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
   )
 }
 
-/** Entity Registry picker: search → pick; falls back to a raw UUID. */
-function CiPicker({ onPick, roles }: { onPick: (e: { entity_uuid: string; display_name: string | null; entity_type: string | null; role: string }) => void; roles: string[] }) {
+type CiPick = { entity_uuid: string; display_name: string | null; entity_type: string | null; role: string }
+
+/** Entity Registry picker. Type a name/identifier (docker-hydra) or paste a
+ *  UUID: the registry resolves it and the match is shown *before* it is linked,
+ *  so a typo never becomes a dangling link. A raw UUID can only be linked blind
+ *  when the registry is unreachable. */
+function CiPicker({ onPick, roles, linked = [], autoFocus }: {
+  onPick: (e: CiPick) => void
+  roles: string[]
+  linked?: { entity_uuid: string; role: string }[]
+  autoFocus?: boolean
+}) {
   const { t } = useTranslation('itsm')
   const [q, setQ] = useState('')
   const [hits, setHits] = useState<RegistryEntity[]>([])
+  const [status, setStatus] = useState<'idle' | 'searching' | 'none' | 'unknown_uuid' | 'unavailable'>('idle')
   const [role, setRole] = useState(roles[0] ?? 'affected')
+  const term = q.trim()
+  const uuidTyped = isUuid(term)
+
   useEffect(() => {
-    if (q.trim().length < 2) { setHits([]); return }
-    const h = window.setTimeout(() => { void registryApi.search(q.trim()).then(setHits) }, 250)
-    return () => window.clearTimeout(h)
-  }, [q])
-  const isUuid = q.trim().length === 36
+    if (term.length < 2) { setHits([]); setStatus('idle'); return }
+    let cancelled = false
+    setStatus('searching')
+    const h = window.setTimeout(async () => {
+      if (uuidTyped) {
+        const res = await registryApi.get(term)
+        if (cancelled) return
+        setHits(res.entity ? [res.entity] : [])
+        setStatus(res.entity ? 'idle' : res.available ? 'unknown_uuid' : 'unavailable')
+      } else {
+        const found = await registryApi.search(term)
+        if (cancelled) return
+        setHits(found)
+        setStatus(found.length ? 'idle' : 'none')
+      }
+    }, 250)
+    return () => { cancelled = true; window.clearTimeout(h) }
+  }, [term, uuidTyped])
+
+  const isLinked = (uuid: string) => linked.some((l) => l.entity_uuid === uuid && l.role === role)
+  const pick = (h: RegistryEntity) => {
+    if (isLinked(h.uuid)) return
+    onPick({ entity_uuid: h.uuid, display_name: h.display_name, entity_type: h.entity_type, role })
+    setQ(''); setHits([]); setStatus('idle')
+  }
+  const hint = (key: string, fallback: string, danger = false) => (
+    <div style={{ fontSize: '0.72rem', color: danger ? 'var(--lx-state-down)' : 'var(--lx-text-muted)' }}>{t(key, { defaultValue: fallback })}</div>
+  )
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
       <div style={{ display: 'flex', gap: '0.4rem' }}>
         <select className="lx-select" value={role} onChange={(e) => setRole(e.target.value)}>
           {roles.map((r) => <option key={r} value={r}>{t(`ci.role.${r}`, { defaultValue: r })}</option>)}
         </select>
-        <input className="lx-input" style={{ flex: 1 }} placeholder={t('ci.searchPlaceholder', { defaultValue: 'Search the Entity Registry or paste a UUID…' })} value={q} onChange={(e) => setQ(e.target.value)} />
-        {isUuid && <Button label={t('common.add', { defaultValue: 'Add' })} icon="link" onClick={() => { onPick({ entity_uuid: q.trim(), display_name: null, entity_type: null, role }); setQ('') }} />}
+        <input className="lx-input" style={{ flex: 1 }} autoFocus={autoFocus}
+          placeholder={t('ci.searchPlaceholder', { defaultValue: 'Search the Entity Registry or paste a UUID…' })}
+          title={t('ci.searchHint', { defaultValue: 'Type a name (e.g. docker-hydra), an identifier or a UUID — pick a result to link it.' })}
+          value={q} onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && hits[0]) { e.preventDefault(); pick(hits[0]) } }} />
+        {uuidTyped && status === 'unavailable' && (
+          <Button label={t('ci.addAnyway', { defaultValue: 'Link UUID anyway' })} icon="link"
+            onClick={() => { onPick({ entity_uuid: term, display_name: null, entity_type: null, role }); setQ(''); setStatus('idle') }} />
+        )}
       </div>
+      {status === 'searching' && hint('ci.resolving', 'Resolving configuration item…')}
+      {status === 'none' && hint('ci.noMatch', 'No matching configuration item in the Entity Registry.')}
+      {status === 'unknown_uuid' && hint('ci.unknownUuid', 'No configuration item with this UUID in the Entity Registry.', true)}
+      {status === 'unavailable' && hint('ci.registryUnavailable', 'Entity Registry not reachable — you can still link a raw UUID.')}
       {hits.length > 0 && (
         <div className="lx-card lx-elevated" style={{ padding: '0.25rem 0', maxHeight: 200, overflow: 'auto' }}>
-          {hits.map((h) => (
-            <div key={h.uuid} className="lx-row-hover" style={{ padding: '0.35rem 0.75rem', cursor: 'pointer', display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.8rem' }}
-              onClick={() => { onPick({ entity_uuid: h.uuid, display_name: h.display_name, entity_type: h.entity_type, role }); setQ(''); setHits([]) }}>
-              <span className="lx-badge lx-badge--muted">{h.entity_type}</span>
-              <span style={{ fontWeight: 600 }}>{h.display_name}</span>
-              <span className="lx-mono" style={{ fontSize: '0.68rem', color: 'var(--lx-text-muted)' }}>{h.identifiers.slice(0, 2).map((i) => `${i.scheme}=${i.value}`).join(' · ')}</span>
-            </div>
-          ))}
+          {hits.map((h) => {
+            const dup = isLinked(h.uuid)
+            return (
+              <div key={h.uuid} className={dup ? '' : 'lx-row-hover'}
+                style={{ padding: '0.35rem 0.75rem', cursor: dup ? 'default' : 'pointer', opacity: dup ? 0.55 : 1, display: 'flex', gap: '0.5rem', alignItems: 'center', fontSize: '0.8rem' }}
+                onClick={() => pick(h)}>
+                <span className="lx-badge lx-badge--muted">{h.entity_type}</span>
+                <span style={{ fontWeight: 600 }}>{h.display_name}</span>
+                <span className="lx-mono" style={{ fontSize: '0.68rem', color: 'var(--lx-text-muted)', flex: 1 }}>{h.identifiers.slice(0, 2).map((i) => `${i.scheme}=${i.value}`).join(' · ')}</span>
+                {dup && <span className="lx-badge lx-badge--muted">{t('ci.alreadyLinked', { defaultValue: 'already linked' })}</span>}
+                <span className="lx-mono" style={{ fontSize: '0.62rem', color: 'var(--lx-text-muted)' }}>{h.uuid.slice(0, 8)}</span>
+              </div>
+            )
+          })}
         </div>
       )}
     </div>
@@ -195,9 +250,9 @@ function useCatalog() {
 // ─── Views ────────────────────────────────────────────────────────────────────
 
 type View =
-  | { kind: 'list' }
+  | { kind: 'list'; ci?: string }
   | { kind: 'detail'; ref: string }
-  | { kind: 'create'; type?: string }
+  | { kind: 'create'; type?: string; ci?: string }
   | { kind: 'catalog' }
 
 function StatsStrip({ stats, catalog }: { stats: Stats | null; catalog: Catalog | null }) {
@@ -217,7 +272,7 @@ function StatsStrip({ stats, catalog }: { stats: Stats | null; catalog: Catalog 
   )
 }
 
-function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref: string) => void }) {
+function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; onOpen: (ref: string) => void; initialCi?: string }) {
   const { t } = useTranslation('itsm')
   const [records, setRecords] = useState<RecordSummary[]>([])
   const [total, setTotal] = useState(0)
@@ -226,6 +281,13 @@ function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref
   const [state, setState] = useState('')
   const [priority, setPriority] = useState('')
   const [includeClosed, setIncludeClosed] = useState(false)
+  // Optional CI filter (deep link /itsm?ci=<uuid>, or "records for this CI").
+  const [ci, setCi] = useState(initialCi ?? '')
+  const [ciName, setCiName] = useState<string | null>(null)
+  useEffect(() => {
+    if (!ci) { setCiName(null); return }
+    void registryApi.get(ci).then((r) => setCiName(r.entity ? `${r.entity.display_name} · ${r.entity.entity_type}` : null))
+  }, [ci])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const rt = typeOf(catalog, type)
@@ -234,7 +296,7 @@ function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref
     setLoading(true)
     setError(null)
     try {
-      const res = await itsmApi.list({ q: q.trim() || undefined, type: type || undefined, state: state || undefined, priority: priority || undefined, include_closed: includeClosed, limit: 500 })
+      const res = await itsmApi.list({ q: q.trim() || undefined, type: type || undefined, state: state || undefined, priority: priority || undefined, ci: ci || undefined, include_closed: includeClosed, limit: 500 })
       setRecords(res.records)
       setTotal(res.total)
     } catch (err) {
@@ -242,7 +304,7 @@ function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref
     } finally {
       setLoading(false)
     }
-  }, [q, type, state, priority, includeClosed])
+  }, [q, type, state, priority, ci, includeClosed])
 
   useEffect(() => {
     const h = window.setTimeout(() => void load(), q ? 250 : 0)
@@ -269,6 +331,13 @@ function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref
           <input type="checkbox" checked={includeClosed} onChange={(e) => setIncludeClosed(e.target.checked)} />
           {t('list.includeClosed', { defaultValue: 'include closed' })}
         </label>
+        {ci && (
+          <span className="lx-badge lx-badge--accent" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
+            <span className="material-icons" style={{ fontSize: 13 }}>fingerprint</span>
+            {t('list.ciFilter', { defaultValue: 'Configuration item' })}: {ciName ?? ci.slice(0, 8)}
+            <button className="lx-icon-btn" title={t('list.ciFilterClear', { defaultValue: 'Remove CI filter' })} onClick={() => setCi('')}><span className="material-icons" style={{ fontSize: 13 }}>close</span></button>
+          </span>
+        )}
         <Button label={t('common.refresh', { defaultValue: 'Refresh' })} icon="refresh" onClick={() => void load()} />
       </div>
       {error && <ErrorBox msg={error} />}
@@ -316,9 +385,10 @@ function RecordList({ catalog, onOpen }: { catalog: Catalog | null; onOpen: (ref
   )
 }
 
-function CreateForm({ catalog, initialType, onCreated, onCancel }: {
+function CreateForm({ catalog, initialType, initialCi, onCreated, onCancel }: {
   catalog: Catalog | null
   initialType?: string
+  initialCi?: string
   onCreated: (ref: string) => void
   onCancel: () => void
 }) {
@@ -327,10 +397,25 @@ function CreateForm({ catalog, initialType, onCreated, onCancel }: {
   const rt = typeOf(catalog, type)
   const [form, setForm] = useState<Record<string, unknown>>({})
   const [custom, setCustom] = useState<Record<string, unknown>>({})
-  const [ciLinks, setCiLinks] = useState<{ entity_uuid: string; display_name: string | null; entity_type: string | null; role: string }[]>([])
+  const [ciLinks, setCiLinks] = useState<CiPick[]>([])
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const set = (k: string, v: unknown) => setForm((f) => ({ ...f, [k]: v }))
+
+  // Deep link /itsm?new=incident&ci=<uuid> (Server Manager / Entity Registry
+  // "report incident"): resolve the CI so the form shows its name, not a UUID.
+  useEffect(() => {
+    if (!initialCi) return
+    void registryApi.get(initialCi).then((r) => {
+      if (r.entity) {
+        setCiLinks([{ entity_uuid: r.entity.uuid, display_name: r.entity.display_name, entity_type: r.entity.entity_type, role: 'affected' }])
+      } else if (!r.available) {
+        setCiLinks([{ entity_uuid: initialCi, display_name: null, entity_type: null, role: 'affected' }])
+      } else {
+        setError(t('ci.notFound', { defaultValue: 'Configuration item {{ref}} was not found in the Entity Registry.', ref: initialCi }))
+      }
+    })
+  }, [initialCi, t])
 
   useEffect(() => {
     // Reset type-specific choices when the type changes; keep title/description.
@@ -453,7 +538,7 @@ function CreateForm({ catalog, initialType, onCreated, onCancel }: {
       )}
 
       <div className="lx-section-title" style={{ marginTop: '1rem' }}>{t('ci.title', { defaultValue: 'Configuration items' })}</div>
-      <CiPicker roles={catalog?.ci_link_roles ?? ['affected']} onPick={(e) => setCiLinks((l) => l.some((x) => x.entity_uuid === e.entity_uuid && x.role === e.role) ? l : [...l, e])} />
+      <CiPicker roles={catalog?.ci_link_roles ?? ['affected']} linked={ciLinks} onPick={(e) => setCiLinks((l) => l.some((x) => x.entity_uuid === e.entity_uuid && x.role === e.role) ? l : [...l, e])} />
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.3rem', marginTop: '0.4rem' }}>
         {ciLinks.map((c) => (
           <span key={`${c.entity_uuid}:${c.role}`} className="lx-badge lx-badge--muted">
@@ -543,12 +628,13 @@ function TransitionModal({ record, rt, toState, onDone, onClose }: {
   )
 }
 
-function RecordDetailView({ ref, catalog, onBack, onOpen, onChanged }: {
+function RecordDetailView({ ref, catalog, onBack, onOpen, onChanged, onFilterCi }: {
   ref: string
   catalog: Catalog | null
   onBack: () => void
   onOpen: (ref: string) => void
   onChanged: () => void
+  onFilterCi?: (ci: string) => void
 }) {
   const { t } = useTranslation('itsm')
   const [record, setRecord] = useState<RecordDetail | null>(null)
@@ -748,11 +834,16 @@ function RecordDetailView({ ref, catalog, onBack, onOpen, onChanged }: {
                     {c.display_name ?? c.entity_uuid.slice(0, 8)}
                   </a>
                   {c.entity_type && <span style={{ color: 'var(--lx-text-muted)', fontSize: '0.7rem' }}>{c.entity_type}</span>}
+                  {onFilterCi && (
+                    <button className="lx-icon-btn" title={t('ci.recordsForCi', { defaultValue: 'Show all records for this configuration item' })} onClick={() => onFilterCi(c.entity_uuid)}>
+                      <span className="material-icons" style={{ fontSize: 15 }}>filter_list</span>
+                    </button>
+                  )}
                   <button className="lx-icon-btn lx-icon-btn--danger" disabled={busy} onClick={() => void run(() => itsmApi.unlinkCi(record.uuid, c.role, c.entity_uuid))}><span className="material-icons" style={{ fontSize: 15 }}>link_off</span></button>
                 </div>
               ))}
               <div style={{ marginTop: '0.5rem' }}>
-                <CiPicker roles={catalog?.ci_link_roles ?? ['affected']} onPick={(e) => void run(() => itsmApi.linkCi(record.uuid, e))} />
+                <CiPicker roles={catalog?.ci_link_roles ?? ['affected']} linked={record.ci_links} onPick={(e) => void run(() => itsmApi.linkCi(record.uuid, e))} />
               </div>
             </div>
 
@@ -856,10 +947,18 @@ export default function PluginApp() {
   const { t } = useTranslation('itsm')
   const { catalog, error: catalogError, setCatalog } = useCatalog()
   const [stats, setStats] = useState<Stats | null>(null)
-  // Deep link: /itsm?record=<uuid|number> opens the record directly.
+  // Deep links: /itsm?record=<uuid|number> opens a record,
+  // /itsm?new=<type>&ci=<uuid> opens the create form with that CI attached
+  // (Server Manager / Entity Registry "report incident"), /itsm?ci=<uuid>
+  // lists the records referencing a CI.
   const initial = useMemo<View>(() => {
-    const ref = new URLSearchParams(window.location.search).get('record')
-    return ref ? { kind: 'detail', ref } : { kind: 'list' }
+    const p = new URLSearchParams(window.location.search)
+    const ref = p.get('record')
+    const ci = p.get('ci') ?? undefined
+    const newType = p.get('new')
+    if (newType !== null) return { kind: 'create', type: newType || undefined, ci }
+    if (ref) return { kind: 'detail', ref }
+    return ci ? { kind: 'list', ci } : { kind: 'list' }
   }, [])
   const [view, setView] = useState<View>(initial)
 
@@ -884,9 +983,9 @@ export default function PluginApp() {
       </div>
       {catalogError && <ErrorBox msg={catalogError} />}
       <StatsStrip stats={stats} catalog={catalog} />
-      {view.kind === 'list' && <RecordList catalog={catalog} onOpen={open} />}
-      {view.kind === 'create' && <CreateForm catalog={catalog} initialType={view.type} onCreated={open} onCancel={() => setView({ kind: 'list' })} />}
-      {view.kind === 'detail' && <RecordDetailView ref={view.ref} catalog={catalog} onBack={() => setView({ kind: 'list' })} onOpen={open} onChanged={refreshStats} />}
+      {view.kind === 'list' && <RecordList key={view.ci ?? ''} catalog={catalog} onOpen={open} initialCi={view.ci} />}
+      {view.kind === 'create' && <CreateForm catalog={catalog} initialType={view.type} initialCi={view.ci} onCreated={open} onCancel={() => setView({ kind: 'list' })} />}
+      {view.kind === 'detail' && <RecordDetailView ref={view.ref} catalog={catalog} onBack={() => setView({ kind: 'list' })} onOpen={open} onChanged={refreshStats} onFilterCi={(ci) => setView({ kind: 'list', ci })} />}
       {view.kind === 'catalog' && <CatalogView catalog={catalog} onBack={() => setView({ kind: 'list' })} onReload={async () => { setCatalog(await itsmApi.reloadCatalog()) }} />}
     </div>
   )

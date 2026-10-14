@@ -114,7 +114,7 @@ Basis: `/api/plugins/lyndrix.plugin.itsm/`. Rechte: `plugin:lyndrix.plugin.itsm:
 | `PATCH` | `/records/{ref}` | Felder ändern; optional `version` |
 | `POST` | `/records/{ref}/transition` | `{to_state, fields?, note?, version?}` |
 | `POST` | `/records/{ref}/journal` | `{kind: comment\|work_note, body}` |
-| `POST` / `DELETE` | `/records/{ref}/ci-links[/{role}/{entity_uuid}]` | CI-Verknüpfungen |
+| `POST` / `DELETE` | `/records/{ref}/ci-links[/{role}/{entity_uuid}]` | CI-Verknüpfungen. Beim Anlegen `entity_uuid` **oder** `ci` (jede Referenz, die die Entity Registry auflöst: UUID, `iac.host:docker-hydra`, reiner Identifier-Wert `docker-hydra`, Anzeigename) plus `role` (`affected`, `caused_by`, `changed`, `related`) |
 | `POST` / `DELETE` | `/records/{ref}/links[/{relation}/{to}]` | Datensatz-Verknüpfungen (`to` = UUID oder Nummer) |
 | `POST` | `/records/{ref}/attachments` | Multipart-Upload (`file`), Größen-/MIME-Limit |
 | `GET` / `DELETE` | `/records/{ref}/attachments/{uuid}` | Download / Löschen |
@@ -129,6 +129,15 @@ Fehlercodes: 400 ungültige Eingabe / fehlende Pflichtfelder, 404 unbekannt, 409
 Administratoren bzw. Connectoren mit `itsm:admin` setzen — ein Agent kann sich so nicht als BMC
 ausgeben (sonst 403).
 
+**CI-Auflösung.** Jede CI-Verknüpfung — in `ci_links` beim Anlegen, nachträglich über
+`/ci-links` oder per Bus — geht durch die Entity Registry
+(`ctx.request("entity_registry:lookup", …)`): ein Name wie `docker-hydra` wird zur UUID,
+Anzeigename und Typ werden aus der Registry gecacht, eine zusammengeführte UUID zeigt auf die
+überlebende Entität, und unbekannte oder mehrdeutige Referenzen werden mit 400 abgelehnt (die
+Kandidaten stehen in der Fehlermeldung). Ist die Registry nicht erreichbar, wird eine rohe UUID
+weiterhin akzeptiert (mit dem mitgegebenen Namen), ein Name allein nicht. Die Liste filtert mit
+`?ci=<uuid>` auf alle Datensätze zu einem CI.
+
 ## Event-Bus
 
 ### Konsumiert
@@ -139,16 +148,19 @@ ausgeben (sonst 403).
 | `itsm:record_update` | `{ref, changes, author, version?, request_id?}` | `itsm:record_update_result` |
 | `itsm:transition` | `{ref, to_state, fields?, note?, author, version?, request_id?}` | `itsm:transition_result` |
 | `itsm:journal_add` | `{ref, kind, body, author}` | — |
+| `itsm:ci_link` | `{ref, ci \| entity_uuid, role?, author, request_id?}` — `ci` ist jede Referenz, die die Registry auflöst (`docker-hydra`, UUID, `schema:wert`) | `itsm:ci_link_result {request_id, ok, record, ci}` |
 
 Mit `ctx.request(...)` (Core-API ≥ 1.4) werden daraus Round-Trips; Fehler ohne `request_id`
-landen auf `itsm:ingest_failed`. Darüber werden später das Event-Management (Alarm → Incident) und
-die IaC-Change-Brücke (Prod-Deploy → Change-Freigabe) angebunden.
+landen auf `itsm:ingest_failed`. Darüber werden später das Event-Management (Alarm → Incident,
+Alarm-Hostname → `itsm:ci_link`) und die IaC-Change-Brücke (Prod-Deploy → Change-Freigabe)
+angebunden.
 
 ### Emittiert
 
 `itsm:record_created {record}`, `itsm:record_updated {record, changes}`,
 `itsm:state_changed {record, from_state, to_state}`, `itsm:journal_added {record_uuid, number,
-entry}`, `entity_registry:register`.
+entry}`, `itsm:ci_link_result` (Antwort), `entity_registry:register` sowie
+`entity_registry:lookup` (Request zur CI-Auflösung, Antwort auf `entity_registry:lookup_result`).
 
 ### Benachrichtigungen
 
@@ -176,14 +188,23 @@ Die Einstellungen werden nach `vault:ready_for_data` angewendet.
 
 ## React-UI
 
-Route `/itsm` (im Shell `/apps/lyndrix-plugin-itsm/itsm`), Deep-Link `?record=<uuid|nummer>`.
+Route `/itsm` (im Shell `/apps/lyndrix-plugin-itsm/itsm`). Deep-Links: `?record=<uuid|nummer>`
+öffnet einen Datensatz, `?new=incident&ci=<uuid>` öffnet das Neu-Formular mit dem CI als
+*betroffen* vorbelegt (so verlinken Server Manager und Entity Registry „Incident melden“),
+`?ci=<uuid>` listet alle Datensätze zu einem CI.
 
-- **Liste**: Suche, Filter Typ/Status/Priorität, „geschlossene einblenden“.
+- **Liste**: Suche, Filter Typ/Status/Priorität, „geschlossene einblenden“, CI-Filter-Chip.
 - **Neu**: Formular wird aus dem Katalog erzeugt (Untertyp, Kategoriebaum, Impact/Urgency mit
-  Prioritätsvorschau, Gruppe, Custom Fields, CI-Picker mit Suche in der Entity Registry).
+  Prioritätsvorschau, Gruppe, Custom Fields, CI-Picker).
+- **CI-Picker** (Neu und Detail): Name oder Identifier tippen (z. B. `docker-hydra`) oder eine
+  UUID einfügen — die Entity Registry löst auf und der Treffer (Typ, Name, Identifier) wird
+  **vor** dem Verknüpfen angezeigt; Enter übernimmt den ersten Treffer, bereits verknüpfte CIs
+  sind markiert. Eine unbekannte UUID wird abgewiesen; nur wenn die Registry nicht erreichbar
+  ist, lässt sich eine rohe UUID verknüpfen.
 - **Detail**: Kopf mit **nur den erlaubten Übergängen** als Buttons; der Übergangsdialog fragt die
   Pflichtfelder des Zielstatus ab; Bearbeiten mit `version`; Verlauf mit Kommentar/Arbeitsnotiz;
-  CIs (Link in die Registry), verknüpfte Datensätze (per Nummer), Anhänge (Upload/Download).
+  CIs (Link in die Registry, „alle Datensätze zu diesem CI“), verknüpfte Datensätze (per Nummer),
+  Anhänge (Upload/Download).
 - **Prozesskatalog**: Lesesicht auf alle Typen, Status und Übergänge; „neu laden“ für Admins.
 
 ## Gateway-Betrieb (Ausblick)
