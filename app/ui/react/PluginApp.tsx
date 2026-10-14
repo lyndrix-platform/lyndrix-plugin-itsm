@@ -198,7 +198,7 @@ function CiPicker({ onPick, roles, linked = [], autoFocus }: {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '0.35rem' }}>
       <div style={{ display: 'flex', gap: '0.4rem' }}>
-        <select className="lx-select" value={role} onChange={(e) => setRole(e.target.value)}>
+        <select className="lx-select" style={{ flex: '0 0 150px', width: 'auto' }} value={role} onChange={(e) => setRole(e.target.value)}>
           {roles.map((r) => <option key={r} value={r}>{t(`ci.role.${r}`, { defaultValue: r })}</option>)}
         </select>
         <input className="lx-input" style={{ flex: 1 }} autoFocus={autoFocus}
@@ -315,15 +315,15 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
     <>
       <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.75rem', alignItems: 'center' }}>
         <input className="lx-input" style={{ flex: '1 1 200px' }} placeholder={t('list.searchPlaceholder', { defaultValue: 'Search number or title…' })} value={q} onChange={(e) => setQ(e.target.value)} />
-        <select className="lx-select" value={type} onChange={(e) => { setType(e.target.value); setState('') }}>
+        <select className="lx-select" style={{ flex: '0 0 160px', width: 'auto' }} value={type} onChange={(e) => { setType(e.target.value); setState('') }}>
           <option value="">{t('list.allTypes', { defaultValue: 'All types' })}</option>
           {catalog?.record_types.map((x) => <option key={x.id} value={x.id}>{x.label}</option>)}
         </select>
-        <select className="lx-select" value={state} onChange={(e) => setState(e.target.value)} disabled={!rt}>
+        <select className="lx-select" style={{ flex: '0 0 160px', width: 'auto' }} value={state} onChange={(e) => setState(e.target.value)} disabled={!rt}>
           <option value="">{t('list.allStates', { defaultValue: 'All states' })}</option>
           {rt?.states.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
         </select>
-        <select className="lx-select" value={priority} onChange={(e) => setPriority(e.target.value)}>
+        <select className="lx-select" style={{ flex: '0 0 150px', width: 'auto' }} value={priority} onChange={(e) => setPriority(e.target.value)}>
           <option value="">{t('list.allPriorities', { defaultValue: 'All priorities' })}</option>
           {['P1', 'P2', 'P3', 'P4'].map((p) => <option key={p} value={p}>{p}</option>)}
         </select>
@@ -813,11 +813,11 @@ function RecordDetailView({ recordRef, catalog, onBack, onOpen, onChanged, onFil
                 ))}
               </div>
               <div style={{ display: 'flex', gap: '0.4rem', alignItems: 'flex-start' }}>
-                <select className="lx-select" value={journalKind} onChange={(e) => setJournalKind(e.target.value as 'comment' | 'work_note')}>
+                <select className="lx-select" style={{ flex: '0 0 150px', width: 'auto' }} value={journalKind} onChange={(e) => setJournalKind(e.target.value as 'comment' | 'work_note')}>
                   <option value="work_note">{t('journal.kind.work_note', { defaultValue: 'Work note' })}</option>
                   <option value="comment">{t('journal.kind.comment', { defaultValue: 'Comment' })}</option>
                 </select>
-                <textarea className="lx-textarea" style={{ flex: 1, minHeight: 60 }} placeholder={t('journal.placeholder', { defaultValue: 'Add to the timeline…' })} value={journalText} onChange={(e) => setJournalText(e.target.value)} />
+                <textarea className="lx-textarea" style={{ flex: '1 1 auto', minWidth: 0, minHeight: 60 }} placeholder={t('journal.placeholder', { defaultValue: 'Add to the timeline…' })} value={journalText} onChange={(e) => setJournalText(e.target.value)} />
                 <Button label={t('journal.add', { defaultValue: 'Add' })} icon="send" variant="primary" disabled={busy || !journalText.trim()} onClick={() => void run(async () => { await itsmApi.addJournal(record.uuid, journalKind, journalText); setJournalText('') })} />
               </div>
             </div>
@@ -862,7 +862,7 @@ function RecordDetailView({ recordRef, catalog, onBack, onOpen, onChanged, onFil
                 </div>
               ))}
               <div style={{ display: 'flex', gap: '0.4rem', marginTop: '0.5rem' }}>
-                <select className="lx-select" value={linkRel} onChange={(e) => setLinkRel(e.target.value)}>
+                <select className="lx-select" style={{ flex: '0 0 170px', width: 'auto' }} value={linkRel} onChange={(e) => setLinkRel(e.target.value)}>
                   {Object.keys(catalog?.record_link_relations ?? {}).map((r) => <option key={r} value={r}>{t(`links.rel.${r}`, { defaultValue: r.replace(/_/g, ' ') })}</option>)}
                 </select>
                 <input className="lx-input lx-mono" style={{ flex: 1 }} placeholder={t('links.placeholder', { defaultValue: 'INC0000042' })} value={linkTo} onChange={(e) => setLinkTo(e.target.value)} />
