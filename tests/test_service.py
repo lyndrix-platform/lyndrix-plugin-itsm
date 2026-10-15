@@ -13,9 +13,12 @@ from sqlalchemy.pool import StaticPool
 class _FakeCtx:
     def __init__(self) -> None:
         self.events: list[tuple[str, dict]] = []
+        self.cluster_topics: list[str] = []
 
-    def emit(self, topic, payload):
+    def emit(self, topic, payload, cluster=False):
         self.events.append((topic, payload))
+        if cluster:
+            self.cluster_topics.append(topic)
 
     def topics(self) -> list[str]:
         return [t for t, _ in self.events]
@@ -422,3 +425,318 @@ def test_create_and_link_with_resolved_ci(svc):
                       entity_type=link["entity_type"], author="m")
     assert {(c["entity_uuid"], c["role"]) for c in rec["ci_links"]} == {(HYDRA, "affected"), (HYDRA, "changed")}
     assert svc.list_records(ci=HYDRA)["total"] == 1
+
+
+# ── Cluster readiness (0.2.0) ──────────────────────────────────────────────────
+
+class _ClusterCtx(_FakeCtx):
+    """Fake context of instance ``a`` in a two-instance cluster."""
+
+    def __init__(self, peers=("b",)) -> None:
+        super().__init__()
+        self.cluster_mode = "cluster"
+        self.instance_id = "a"
+        self.cluster_instances = [{"instance_id": "a", "alive": True, "is_self": True}] + [
+            {"instance_id": p, "alive": True, "is_self": False} for p in peers
+        ]
+        self.statuses: list[tuple[str, dict]] = []
+
+    def set_status(self, phase, **kw):
+        self.statuses.append((phase, kw))
+
+
+def _op_error(code: int, msg: str = "simulated"):
+    from sqlalchemy.exc import OperationalError
+
+    return OperationalError("UPDATE ...", {}, Exception(code, msg))
+
+
+def test_ensure_tables_is_idempotent_locked_and_race_tolerant(svc, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.model import database
+
+    taken: list[str] = []
+
+    @contextmanager
+    def _lock(name):
+        taken.append(name)
+        yield True
+
+    monkeypatch.setattr(database.db_instance, "advisory_lock", _lock, raising=False)
+    real = database._Base.metadata.create_all
+    calls = {"n": 0}
+
+    def _create_all(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _op_error(1050, "Table 'itsm_records' already exists")
+        return real(*a, **kw)
+
+    monkeypatch.setattr(database._Base.metadata, "create_all", _create_all)
+    svc._ready = False
+    svc.on_db_connected()
+    assert svc.is_ready and taken == ["lyndrix_bootstrap"] and calls["n"] == 2
+
+
+def test_init_db_sets_ready_off_loop(svc):
+    import asyncio
+
+    svc._ready = False
+    assert asyncio.run(svc.init_db("test", attempts=1)) is True
+    assert svc.is_ready
+
+
+def test_attachment_path_is_stored_relative_and_legacy_absolute_still_works(svc, tmp_path):
+    from sqlalchemy import text
+
+    from app.model.database import get_session
+
+    rec = _inc(svc)
+    meta = svc.add_attachment(rec["uuid"], "a.txt", "text/plain", b"rel", author="m")
+    with get_session() as s:
+        stored = s.execute(text("SELECT storage_path FROM itsm_attachments")).scalar_one()
+    assert stored == f"{rec['uuid']}/{meta['uuid']}"
+    # The root moves (other mount point) → still found.
+    moved = tmp_path / "moved"
+    (svc.attachment_dir).rename(moved)
+    svc.attachment_dir = moved
+    assert svc.get_attachment(rec["uuid"], meta["uuid"])[1].read_bytes() == b"rel"
+
+    # 0.1.x row with an absolute path.
+    legacy = tmp_path / "legacy.bin"
+    legacy.write_bytes(b"old")
+    meta2 = svc.add_attachment(rec["uuid"], "b.txt", "text/plain", b"x", author="m")
+    with get_session() as s:
+        s.execute(text("UPDATE itsm_attachments SET storage_path = :p WHERE uuid = :u"),
+                  {"p": str(legacy), "u": meta2["uuid"]})
+        s.commit()
+    assert svc.get_attachment(rec["uuid"], meta2["uuid"])[1].read_bytes() == b"old"
+    assert svc.delete_attachment(rec["uuid"], meta2["uuid"]) is True
+    assert not legacy.exists()
+
+
+def test_attachment_path_cannot_escape_root(svc):
+    from app.logic import attachments as att
+
+    with pytest.raises(ValueError):
+        att.resolve_path(svc.attachment_dir, "../../etc/passwd")
+
+
+def test_attachment_file_removed_when_commit_fails(svc, monkeypatch):
+    rec = _inc(svc)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(svc, "_journal", _boom)
+    with pytest.raises(RuntimeError):
+        svc.add_attachment(rec["uuid"], "a.txt", "text/plain", b"data", author="m")
+    folder = svc.attachment_dir / rec["uuid"]
+    assert not any(folder.iterdir())
+
+
+def test_cluster_storage_not_shared_reports_degraded(svc):
+    from app.logic import attachments as att
+
+    svc.set_context(_ClusterCtx(peers=("b",)))
+    status, details = svc.health_report()
+    assert status == "degraded" and details["reason"] == "attachment_dir_not_shared"
+    assert details["attachment_storage"]["shared"] is False
+    assert (svc.attachment_dir / ".cluster" / "a").is_file()  # own marker written
+    assert svc._ctx.statuses[-1][0] == "degraded"
+    assert svc._ctx.statuses[-1][1]["blocking"] is False
+
+    # Peer b's marker becomes visible (shared RWX mount) → ok again, banner cleared.
+    att.write_marker(svc.attachment_dir, "b")
+    svc.storage_check(force=True)
+    status, details = svc.health_report()
+    assert status == "ok" and details["attachment_storage"]["shared"] is True
+    assert svc._ctx.statuses[-1][0] == "ready"
+    n = len(svc._ctx.statuses)
+    svc.health_report()
+    assert len(svc._ctx.statuses) == n  # unchanged → nothing re-sent
+
+
+def test_cluster_storage_without_live_peers_is_unknown_not_degraded(svc):
+    svc.set_context(_ClusterCtx(peers=()))
+    status, details = svc.health_report()
+    assert status == "ok" and details["attachment_storage"]["shared"] is None
+
+
+def test_storage_check_is_cached(svc, monkeypatch):
+    from app.logic import attachments as att
+
+    calls = {"n": 0}
+    real = att.dir_writable
+
+    def _count(path):
+        calls["n"] += 1
+        return real(path)
+
+    monkeypatch.setattr(att, "dir_writable", _count)
+    svc.health_report()
+    svc.health_report()
+    assert calls["n"] == 1
+    svc.storage_check(force=True)
+    assert calls["n"] == 2
+
+
+def test_settings_apply_catalog_dir_and_report_missing(svc, tmp_path):
+    import shutil
+
+    from app.logic.catalog import DEFAULT_CATALOG_DIR
+
+    own = tmp_path / "cat"
+    shutil.copytree(DEFAULT_CATALOG_DIR / "record_types", own / "record_types")
+    (own / "record_types" / "task.yml").unlink()
+    svc.apply_settings({"catalog_dir": str(own), "max_attachment_mb": "2",
+                        "attachment_dir": str(tmp_path / "files")})
+    assert "task" not in svc.catalog.types()
+    assert svc.max_attachment_bytes == 2 * 1024 * 1024
+    assert svc.attachment_dir == tmp_path / "files"
+
+    svc.apply_settings({"catalog_dir": str(tmp_path / "nope")})
+    status, details = svc.health_report()
+    assert status == "degraded" and "catalog_dir_missing" in details["problems"]
+    assert "task" not in svc.catalog.types()  # kept the last good catalog
+
+    svc.apply_settings({"catalog_dir": ""})
+    assert "task" in svc.catalog.types() and svc.catalog_dir_missing is None
+
+
+def test_catalog_reload_is_announced_cluster_wide(svc):
+    svc.reload_catalog()
+    assert svc._ctx.cluster_topics == []
+    svc.reload_catalog(announce=True)
+    assert svc._ctx.cluster_topics == ["itsm:catalog_reloaded"]
+
+
+def test_create_retries_on_snapshot_conflict(svc, monkeypatch):
+    real = svc._allocate_number
+    calls = {"n": 0}
+
+    def _flaky(rt):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _op_error(1020, "Record has changed since last read in table 'itsm_counters'")
+        return real(rt)
+
+    monkeypatch.setattr(svc, "_allocate_number", _flaky)
+    rec = _inc(svc)
+    assert rec["number"] == "INC0000001" and calls["n"] == 2
+    assert _inc(svc)["number"] == "INC0000002"
+
+
+def test_counter_row_race_is_retried(svc, monkeypatch):
+    """Our UPDATE found no counter row; a peer inserts it before our INSERT."""
+    from contextlib import contextmanager
+
+    import app.logic.service as service_mod
+    from app.model.models import Counter
+
+    real_get_session = service_mod.get_session
+    state = {"raced": False}
+
+    @contextmanager
+    def _racing_session():
+        with real_get_session() as s:
+            real_add = s.add
+
+            def _add(obj, *a, **kw):
+                if isinstance(obj, Counter) and not state["raced"]:
+                    state["raced"] = True
+                    with real_get_session() as peer:
+                        peer.add(Counter(record_type=obj.record_type, last_value=7))
+                        peer.commit()
+                return real_add(obj, *a, **kw)
+
+            s.add = _add
+            yield s
+
+    monkeypatch.setattr(service_mod, "get_session", _racing_session)
+    assert svc._allocate_number(svc.catalog.record_type("incident")) == "INC0000008"
+    assert state["raced"]
+
+
+def test_concurrent_update_maps_to_version_conflict_or_retries(svc, monkeypatch):
+    from sqlalchemy import text
+
+    from app.logic.service import VersionConflict
+
+    rec = _inc(svc)
+    real = svc._bump_version
+    state = {"peer_writes": 0, "limit": 1}
+
+    def _peer_then_bump(s, r, base):
+        if state["peer_writes"] < state["limit"]:
+            state["peer_writes"] += 1
+            # A peer committed a write between our read and our UPDATE.
+            s.execute(text("UPDATE itsm_records SET version = version + 1 WHERE uuid = :u"),
+                      {"u": r.uuid})
+        return real(s, r, base)
+
+    monkeypatch.setattr(svc, "_bump_version", _peer_then_bump)
+    with pytest.raises(VersionConflict, match="concurrently"):
+        svc.update_record(rec["uuid"], {"title": "mine"}, expected_version=1)
+    assert svc.get_record(rec["uuid"])["title"] == "DNS down"  # rolled back
+
+    # No expected_version → one retry on fresh data succeeds.
+    state.update(peer_writes=0, limit=1)
+    upd = svc.update_record(rec["uuid"], {"title": "mine"})
+    assert upd["title"] == "mine" and upd["version"] == 2
+    # Persistent contention → VersionConflict after the single retry.
+    state.update(peer_writes=0, limit=5)
+    with pytest.raises(VersionConflict):
+        svc.transition(rec["uuid"], "in_progress", fields={"assignee": "m"})
+
+
+def test_snapshot_conflict_on_transition_maps_to_409(svc, monkeypatch):
+    from app.logic.service import VersionConflict
+
+    rec = _inc(svc)
+
+    def _boom(*a, **kw):
+        raise _op_error(1020, "Record has changed since last read in table 'itsm_records'")
+
+    monkeypatch.setattr(svc, "_transition_tx", _boom)
+    with pytest.raises(VersionConflict):
+        svc.transition(rec["uuid"], "in_progress", expected_version=1)
+
+
+def test_version_conflict_maps_to_http_409(svc):
+    import asyncio
+
+    from fastapi import HTTPException
+
+    from app.api import build_plugin_router
+    from app.logic.service import VersionConflict
+
+    router = build_plugin_router(svc)
+    # _call is a closure; reach it through any route's dependency-free path:
+    # emulate by calling the service through the same mapping helper.
+    _call = None
+    for route in router.routes:
+        fn = getattr(route, "endpoint", None)
+        cells = getattr(fn, "__closure__", None) or ()
+        for c in cells:
+            if getattr(c.cell_contents, "__name__", "") == "_call":
+                _call = c.cell_contents
+                break
+        if _call:
+            break
+    assert _call is not None
+
+    def _raise():
+        raise VersionConflict("x")
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(_call(_raise))
+    assert exc.value.status_code == 409
+
+
+def test_health_report_is_one_cheap_count(svc):
+    _inc(svc)
+    status, details = svc.health_report()
+    assert status == "ok" and details["open"] == 1
+    assert "open_by_type" not in details

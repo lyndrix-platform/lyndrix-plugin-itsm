@@ -291,7 +291,7 @@ def build_plugin_router(service: ItsmService) -> APIRouter:
     @router.post("/catalog/reload")
     async def reload_catalog(identity: ApiIdentity = Depends(require_permission(PERM_ADMIN))):
         def _run() -> dict:
-            service.reload_catalog()
+            service.reload_catalog(announce=True)  # peers reload on the cluster event
             return service.catalog.to_payload()
 
         try:

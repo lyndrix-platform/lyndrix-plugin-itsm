@@ -14,27 +14,58 @@ entity_registry:register — every new record is announced as an itsm_record
                             entity (fire-and-forget; works without the registry)
 entity_registry:lookup   — request (via ctx.request) to resolve a CI reference
                             for a CI link; reply on entity_registry:lookup_result
+itsm:catalog_reloaded    — {reloaded_at}, cluster=True, after an operator reload
+
+Cluster (core API ≥ 1.7)
+------------------------
+All state is in the shared DB; the catalog and settings are re-applied on every
+instance via cluster events. Record numbers come from a short READ COMMITTED
+counter transaction, record writes are guarded by a conditional
+``UPDATE … WHERE version = :v`` and retried on MariaDB 1020/1205/1213.
+Attachments need a directory every instance sees (RWX/NFS) — see
+``attachments.py`` for the sharing check.
 """
 from __future__ import annotations
 
 import asyncio
+import functools
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
-from ..model.database import ensure_tables, get_session
+from ..model.database import ensure_tables, get_session, is_retryable, retry_write
 from ..model.models import Attachment, CiLink, Counter, JournalEntry, Record, RecordLink
 from . import attachments as att
-from .catalog import CI_LINK_ROLES, RECORD_LINK_RELATIONS, CatalogError, CatalogLoader, RecordTypeDef
+from .catalog import (
+    CI_LINK_ROLES,
+    DEFAULT_CATALOG_DIR,
+    RECORD_LINK_RELATIONS,
+    CatalogError,
+    CatalogLoader,
+    RecordTypeDef,
+)
 
 log = get_logger("Plugin:ITSM:Service")
 
 SOURCE_ID = "itsm"
+CATALOG_RELOADED_TOPIC = "itsm:catalog_reloaded"
+# health() is polled by every dashboard: the attachment-dir probe (write test +
+# cluster marker) runs at most this often.
+STORAGE_CHECK_TTL = 60.0
+_PROBLEM_TEXT = {
+    "attachment_dir_not_writable": "Attachment directory is not writable",
+    "attachment_dir_not_shared": (
+        "Attachment directory is not shared with the other instances — mount it as an "
+        "RWX/NFS volume, otherwise attachments uploaded elsewhere are missing here"
+    ),
+    "catalog_dir_missing": "Configured catalog directory is missing on this instance — using the built-in catalog",
+}
 JOURNAL_USER_KINDS = ("comment", "work_note")
 
 # Fields a PATCH may touch. state is changed only via transition(); identity
@@ -59,6 +90,10 @@ class VersionConflict(Exception):
 
 class TransitionError(Exception):
     """Transition not allowed from the current state → HTTP 409."""
+
+
+class _StaleRecord(Exception):
+    """The conditional version bump matched no row (a concurrent writer won)."""
 
 
 def _now() -> datetime:
@@ -87,6 +122,10 @@ class ItsmService:
         self.max_attachment_bytes = 25 * 1024 * 1024
         self.allowed_mime: tuple[str, ...] = att.DEFAULT_ALLOWED_MIME
         self._registry_warned = False
+        # Operator catalog_dir that does not exist on this instance (health → degraded).
+        self.catalog_dir_missing: str | None = None
+        self._storage_cache: tuple[float, dict] | None = None
+        self._status_message: str | None = None  # last degraded message sent via set_status
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -98,9 +137,24 @@ class ItsmService:
             self._loop = None
 
     def on_db_connected(self) -> None:
+        """Bootstrap tables (bootstrap-locked, peer-race tolerant), then go ready."""
         ensure_tables()
         self._ready = True
         log.info("ITSM: DB tables ready")
+
+    async def init_db(self, reason: str, *, attempts: int = 5, pause: float = 5.0) -> bool:
+        """Run :meth:`on_db_connected` off-loop; retry a failed bootstrap a few
+        times instead of staying not-ready until the next restart."""
+        for attempt in range(1, attempts + 1):
+            try:
+                await asyncio.to_thread(self.on_db_connected)
+                log.info(f"ITSM: tables ready ({reason})")
+                return True
+            except Exception as exc:
+                log.error(f"ITSM: DB init failed ({reason}, attempt {attempt}/{attempts}) — {exc}")
+                if attempt < attempts:
+                    await asyncio.sleep(pause * attempt)
+        return False
 
     @property
     def is_ready(self) -> bool:
@@ -113,22 +167,120 @@ class ItsmService:
     def set_catalog_dir(self, path: str | Path) -> None:
         self.catalog.catalog_dir = Path(path)
 
-    def reload_catalog(self) -> None:
+    def reload_catalog(self, *, announce: bool = False) -> None:
+        """Re-read the catalog. ``announce=True`` (operator-triggered reload)
+        tells the other cluster instances to reload theirs as well."""
         self.catalog.reload()
+        if announce:
+            self._emit(CATALOG_RELOADED_TOPIC, {"reloaded_at": _now().isoformat()}, cluster=True)
+
+    def apply_settings(self, settings: dict) -> None:
+        """Apply the operator settings (Vault-backed schema in the manifest).
+
+        Runs on ``vault:ready_for_data`` and on every ``plugin:settings_changed``
+        for this plugin — on each instance, so all of them converge.
+        """
+        settings = settings or {}
+        att_dir = str(settings.get("attachment_dir") or "").strip()
+        if att_dir and Path(att_dir) != self.attachment_dir:
+            self.attachment_dir = Path(att_dir)
+            self._storage_cache = None
+        try:
+            mb = int(settings.get("max_attachment_mb") or 0)
+            if mb > 0:
+                self.max_attachment_bytes = mb * 1024 * 1024
+        except (TypeError, ValueError):
+            log.warning("ITSM: max_attachment_mb is not an integer — keeping the current limit")
+        cat_dir = str(settings.get("catalog_dir") or "").strip()
+        if cat_dir:
+            if Path(cat_dir).is_dir():
+                self.catalog_dir_missing = None
+                if Path(cat_dir) != self.catalog.catalog_dir:
+                    self.set_catalog_dir(cat_dir)
+                    self.reload_catalog()
+                    log.info(f"ITSM: using operator catalog at {cat_dir}")
+            else:
+                self.catalog_dir_missing = cat_dir
+                log.warning(f"ITSM: catalog_dir '{cat_dir}' not found on this instance — keeping the current catalog")
+        else:
+            self.catalog_dir_missing = None
+            if self.catalog.catalog_dir != DEFAULT_CATALOG_DIR:
+                self.set_catalog_dir(DEFAULT_CATALOG_DIR)
+                self.reload_catalog()
+                log.info("ITSM: catalog_dir cleared — back to the built-in catalog")
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
-    def _next_number(self, s, rt: RecordTypeDef) -> str:
-        """Allocate the next human number under a row lock (same transaction)."""
-        counter = s.execute(
-            select(Counter).where(Counter.record_type == rt.id).with_for_update()
-        ).scalar_one_or_none()
-        if counter is None:
-            counter = Counter(record_type=rt.id, last_value=0)
-            s.add(counter)
-            s.flush()
-        counter.last_value += 1
-        return f"{rt.prefix}{counter.last_value:0{rt.number_width}d}"
+    def _allocate_number(self, rt: RecordTypeDef) -> str:
+        """Allocate the next human number in its own short transaction.
+
+        An atomic ``UPDATE … SET last_value = last_value + 1`` (READ COMMITTED)
+        never reads a stale snapshot, so it cannot hit MariaDB 1020; the first
+        record of a type inserts the counter row (a concurrent insert loses
+        with IntegrityError and simply retries the increment). A number whose
+        record insert fails afterwards is skipped — numbers are unique, not
+        gap-free.
+        """
+        def _tx() -> int:
+            with get_session() as s:
+                res = s.execute(
+                    update(Counter).where(Counter.record_type == rt.id)
+                    .values(last_value=Counter.last_value + 1)
+                    .execution_options(synchronize_session=False)
+                )
+                if res.rowcount == 0:
+                    s.add(Counter(record_type=rt.id, last_value=1))
+                    s.commit()
+                    return 1
+                value = s.execute(
+                    select(Counter.last_value).where(Counter.record_type == rt.id)
+                ).scalar_one()
+                s.commit()
+                return int(value)
+
+        try:
+            value = retry_write(_tx)
+        except IntegrityError:  # a peer created the counter row first
+            value = retry_write(_tx)
+        return f"{rt.prefix}{value:0{rt.number_width}d}"
+
+    def _bump_version(self, s, rec: Record, base_version: int) -> None:
+        """Flush pending changes, then ``UPDATE … SET version = v+1 WHERE uuid
+        AND version = v``. A miss means another writer (any instance) committed
+        in between; the caller rolls the whole transaction back."""
+        s.flush()
+        res = s.execute(
+            update(Record).where(Record.uuid == rec.uuid, Record.version == base_version)
+            .values(version=base_version + 1)
+            .execution_options(synchronize_session=False)
+        )
+        if res.rowcount != 1:
+            raise _StaleRecord(rec.number)
+
+    def _versioned_write(self, tx, *, expected_version: int | None):
+        """Run a record write; map a lost optimistic lock (rowcount miss,
+        1020/1205/1213) to :class:`VersionConflict`. Without ``expected_version``
+        the caller did not ask for a lock, so the write is re-run once on fresh
+        data before giving up."""
+        attempts = 1 if expected_version is not None else 2
+        for attempt in range(attempts):
+            try:
+                return tx()
+            except _StaleRecord as exc:
+                err: Exception = exc
+                number = str(exc)
+            except Exception as exc:
+                if not is_retryable(exc):
+                    raise
+                err, number = exc, "record"
+            if attempt + 1 < attempts:
+                log.info(f"ITSM: concurrent write on {number} — retrying once on fresh data")
+                time.sleep(0.05)
+                continue
+            raise VersionConflict(
+                f"{number} was modified concurrently — reload and try again"
+            ) from err
+        raise AssertionError("unreachable")  # pragma: no cover
 
     def _journal(self, s, record_uuid: str, kind: str, author: str | None,
                  body: str | None = None, data: dict | None = None) -> JournalEntry:
@@ -254,47 +406,50 @@ class ItsmService:
         if bool(source) != bool(external_id):
             raise ItsmError("source and external_id must be given together")
 
-        for attempt in range(3):
+        def _tx() -> dict:
             with get_session() as s:
-                try:
-                    if source and s.execute(
-                        select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
-                    ).scalar_one_or_none():
-                        raise ItsmError(f"Record {source}/{external_id} already exists")
-                    number = self._next_number(s, rt)
-                    rec = Record(
-                        uuid=str(uuid4()), number=number, record_type=rt.id,
-                        subtype=fields.get("subtype"), category=fields.get("category"),
-                        title=fields["title"], description=fields.get("description"),
-                        state=rt.initial_state().id, impact=impact, urgency=urgency,
-                        priority=rt.derive_priority(impact, urgency),
-                        assignment_group=fields.get("assignment_group"),
-                        assignee=fields.get("assignee"), requester=fields.get("requester") or author,
-                        created_by=author, custom_fields=custom, tags=fields.get("tags", []),
-                        opened_at=_now(), due_at=fields.get("due_at"), version=1,
-                        source=source, external_id=external_id,
-                        external_url=(data.get("external_url") or None),
-                    )
-                    s.add(rec)
-                    s.flush()  # parent row first — CiLink/Journal FKs reference it
-                    for link in ci_links:
-                        s.add(CiLink(record_uuid=rec.uuid, **link))
-                    self._journal(s, rec.uuid, "system", author, "created",
-                                  {"state": rec.state, "ci_links": len(ci_links)})
-                    s.commit()
-                except IntegrityError as exc:
-                    s.rollback()
-                    # Lost a race with a concurrent push of the same external key.
-                    # MariaDB names the constraint; SQLite lists the columns.
-                    msg = str(exc.orig)
-                    if source and ("uq_itsm_source_ext" in msg or "external_id" in msg):
-                        raise ItsmError(f"Record {source}/{external_id} already exists") from exc
-                    if attempt == 2:
-                        raise
-                    continue  # counter/number race — retry
+                if source and s.execute(
+                    select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
+                ).scalar_one_or_none():
+                    raise ItsmError(f"Record {source}/{external_id} already exists")
+                number = self._allocate_number(rt)
+                rec = Record(
+                    uuid=str(uuid4()), number=number, record_type=rt.id,
+                    subtype=fields.get("subtype"), category=fields.get("category"),
+                    title=fields["title"], description=fields.get("description"),
+                    state=rt.initial_state().id, impact=impact, urgency=urgency,
+                    priority=rt.derive_priority(impact, urgency),
+                    assignment_group=fields.get("assignment_group"),
+                    assignee=fields.get("assignee"), requester=fields.get("requester") or author,
+                    created_by=author, custom_fields=custom, tags=fields.get("tags", []),
+                    opened_at=_now(), due_at=fields.get("due_at"), version=1,
+                    source=source, external_id=external_id,
+                    external_url=(data.get("external_url") or None),
+                )
+                s.add(rec)
+                s.flush()  # parent row first — CiLink/Journal FKs reference it
+                for link in ci_links:
+                    s.add(CiLink(record_uuid=rec.uuid, **link))
+                self._journal(s, rec.uuid, "system", author, "created",
+                              {"state": rec.state, "ci_links": len(ci_links)})
+                s.commit()
                 s.refresh(rec)
-                detail = self._detail(s, rec)
-            break
+                return self._detail(s, rec)
+
+        for attempt in range(3):
+            try:
+                # Whole create re-run on MariaDB 1020/1205/1213 (fresh number each time).
+                detail = retry_write(_tx)
+                break
+            except IntegrityError as exc:
+                # Lost a race with a concurrent push of the same external key.
+                # MariaDB names the constraint; SQLite lists the columns.
+                msg = str(exc.orig)
+                if source and ("uq_itsm_source_ext" in msg or "external_id" in msg):
+                    raise ItsmError(f"Record {source}/{external_id} already exists") from exc
+                if attempt == 2:
+                    raise
+                # number collision (e.g. counter behind imported rows) — next number
 
         log.info(f"ITSM: created {detail['number']} '{detail['title']}' by {author}")
         self._emit("itsm:record_created", {"record": detail})
@@ -359,6 +514,16 @@ class ItsmService:
         unknown = sorted(set(changes) - set(_UPDATABLE))
         if unknown:
             raise ItsmError(f"Field(s) not updatable: {', '.join(unknown)}")
+        detail, diff = self._versioned_write(
+            lambda: self._update_tx(ref, changes, author, expected_version),
+            expected_version=expected_version,
+        )
+        if diff:
+            log.info(f"ITSM: updated {detail['number']} {sorted(diff)} by {author}")
+            self._emit("itsm:record_updated", {"record": detail, "changes": diff})
+        return detail
+
+    def _update_tx(self, ref, changes, author, expected_version) -> tuple[dict, dict]:
         with get_session() as s:
             rec = self._get(s, ref)
             if rec is None:
@@ -367,6 +532,7 @@ class ItsmService:
                 raise VersionConflict(
                     f"{rec.number} was modified (version {rec.version}, you sent {expected_version})"
                 )
+            base_version = rec.version
             rt = self.catalog.record_type(rec.record_type)
             fields = self._validate_classification(rt, changes, partial=True)
             diff: dict[str, dict] = {}
@@ -393,21 +559,27 @@ class ItsmService:
                     diff["priority"] = {"old": rec.priority, "new": new_prio}
                     rec.priority = new_prio
             if not diff:
-                return self._detail(s, rec)
-            rec.version += 1
+                return self._detail(s, rec), {}
             self._journal(s, rec.uuid, "field_change", author, None, {"changes": diff})
+            self._bump_version(s, rec, base_version)
             s.commit()
             s.refresh(rec)
-            detail = self._detail(s, rec)
-        log.info(f"ITSM: updated {detail['number']} {sorted(diff)} by {author}")
-        self._emit("itsm:record_updated", {"record": detail, "changes": diff})
-        return detail
+            return self._detail(s, rec), diff
 
     def transition(self, ref: str, to_state: str, *, fields: dict | None = None,
                    author: str | None = None, note: str | None = None,
                    expected_version: int | None = None) -> dict:
         self._require_ready()
         fields = dict(fields or {})
+        detail, from_state = self._versioned_write(
+            lambda: self._transition_tx(ref, to_state, fields, author, note, expected_version),
+            expected_version=expected_version,
+        )
+        log.info(f"ITSM: {detail['number']} {from_state} → {to_state} by {author}")
+        self._emit("itsm:state_changed", {"record": detail, "from_state": from_state, "to_state": to_state})
+        return detail
+
+    def _transition_tx(self, ref, to_state, fields, author, note, expected_version) -> tuple[dict, str]:
         with get_session() as s:
             rec = self._get(s, ref)
             if rec is None:
@@ -416,6 +588,7 @@ class ItsmService:
                 raise VersionConflict(
                     f"{rec.number} was modified (version {rec.version}, you sent {expected_version})"
                 )
+            base_version = rec.version
             rt = self.catalog.record_type(rec.record_type)
             target = rt.state(to_state)
             if target is None:
@@ -459,15 +632,12 @@ class ItsmService:
             else:
                 rec.resolved_at = None
                 rec.closed_at = None
-            rec.version += 1
             self._journal(s, rec.uuid, "state_change", author, note,
                           {"from": from_state, "to": to_state, "fields": sorted(fields)})
+            self._bump_version(s, rec, base_version)
             s.commit()
             s.refresh(rec)
-            detail = self._detail(s, rec)
-        log.info(f"ITSM: {detail['number']} {from_state} → {to_state} by {author}")
-        self._emit("itsm:state_changed", {"record": detail, "from_state": from_state, "to_state": to_state})
-        return detail
+            return self._detail(s, rec), from_state
 
     # ── Journal ──────────────────────────────────────────────────────────────
 
@@ -676,13 +846,18 @@ class ItsmService:
             if rec is None:
                 raise NotFound(f"Unknown record: {ref}")
             att_uuid = str(uuid4())
-            path, digest = att.store_bytes(self.attachment_dir, rec.uuid, att_uuid, data)
-            row = Attachment(uuid=att_uuid, record_uuid=rec.uuid, filename=name, content_type=ctype,
-                             size=len(data), sha256=digest, storage_path=path, uploaded_by=author)
-            s.add(row)
-            self._journal(s, rec.uuid, "attachment", author, None,
-                          {"attachment": att_uuid, "filename": name, "size": len(data), "action": "added"})
-            s.commit()
+            root = self.attachment_dir
+            rel_path, digest = att.store_bytes(root, rec.uuid, att_uuid, data)
+            try:
+                row = Attachment(uuid=att_uuid, record_uuid=rec.uuid, filename=name, content_type=ctype,
+                                 size=len(data), sha256=digest, storage_path=rel_path, uploaded_by=author)
+                s.add(row)
+                self._journal(s, rec.uuid, "attachment", author, None,
+                              {"attachment": att_uuid, "filename": name, "size": len(data), "action": "added"})
+                s.commit()
+            except BaseException:
+                att.remove_file(att.resolve_path(root, rel_path))  # no orphan file without a row
+                raise
             s.refresh(row)
             return row.to_dict()
 
@@ -693,7 +868,11 @@ class ItsmService:
             row = s.get(Attachment, attachment_uuid) if rec else None
             if rec is None or row is None or row.record_uuid != rec.uuid:
                 raise NotFound("Unknown attachment")
-            return row.to_dict(), Path(row.storage_path)
+            try:
+                path = att.resolve_path(self.attachment_dir, row.storage_path)
+            except ValueError as exc:
+                raise NotFound("Unknown attachment") from exc
+            return row.to_dict(), path
 
     def delete_attachment(self, ref: str, attachment_uuid: str, *, author: str | None = None) -> bool:
         self._require_ready()
@@ -707,7 +886,10 @@ class ItsmService:
             self._journal(s, rec.uuid, "attachment", author, None,
                           {"attachment": attachment_uuid, "filename": name, "action": "removed"})
             s.commit()
-        att.remove_file(path)
+        try:
+            att.remove_file(att.resolve_path(self.attachment_dir, path))
+        except ValueError:
+            log.warning(f"ITSM: not removing attachment outside the attachment dir: {path}")
         return True
 
     # ── Stats ────────────────────────────────────────────────────────────────
@@ -729,6 +911,107 @@ class ItsmService:
         return {"open": sum(by_type.values()), "total": total_all,
                 "open_by_type": by_type, "open_by_priority": by_priority}
 
+    # ── Health / cluster storage check ───────────────────────────────────────
+
+    def _cluster_view(self) -> tuple[str, str | None, list[str]]:
+        """``(cluster_mode, own instance id, live peer ids)`` — single mode on
+        cores without the cluster API."""
+        ctx = self._ctx
+        mode = str(getattr(ctx, "cluster_mode", "single") or "single")
+        me = getattr(ctx, "instance_id", None)
+        peers: list[str] = []
+        if mode == "cluster":
+            try:
+                instances = list(getattr(ctx, "cluster_instances", None) or [])
+            except Exception as exc:  # coordinator hiccup → treat as "no peers known"
+                log.debug(f"ITSM: cluster_instances unavailable — {exc}")
+                instances = []
+            peers = [str(i.get("instance_id")) for i in instances
+                     if i.get("alive") and not i.get("is_self") and i.get("instance_id")]
+        return mode, (str(me) if me else None), peers
+
+    def storage_check(self, *, force: bool = False) -> dict:
+        """Probe the attachment directory (cached for ``STORAGE_CHECK_TTL``).
+
+        Single mode: writable or not. Cluster mode: also refresh this
+        instance's marker and look for the markers of the other live instances;
+        ``shared`` is True when at least one is visible, False when peers are
+        alive but none is visible, None when there is no live peer to compare.
+        """
+        now = time.monotonic()
+        cached = self._storage_cache
+        if not force and cached and now - cached[0] < STORAGE_CHECK_TTL:
+            return cached[1]
+        root = self.attachment_dir
+        mode, me, peers = self._cluster_view()
+        info: dict = {"writable": att.dir_writable(root), "cluster_mode": mode}
+        if mode == "cluster":
+            if info["writable"] and me:
+                try:
+                    att.write_marker(root, me)
+                except OSError as exc:
+                    log.debug(f"ITSM: cannot write cluster marker — {exc}")
+            visible = att.visible_markers(root, peers)
+            info.update(peers=len(peers), peers_visible=len(visible),
+                        shared=(bool(visible) if peers else None))
+        self._storage_cache = (now, info)
+        return info
+
+    def problems(self, storage: dict) -> list[str]:
+        out = []
+        if not storage.get("writable"):
+            out.append("attachment_dir_not_writable")
+        if storage.get("shared") is False:
+            out.append("attachment_dir_not_shared")
+        if self.catalog_dir_missing:
+            out.append("catalog_dir_missing")
+        return out
+
+    def health_report(self) -> tuple[str, dict]:
+        """``(status, details)`` for the plugin ``health()`` hook — one cheap
+        count plus the cached storage probe; also syncs the runtime status
+        banner (``degraded``, non-blocking) with the problems found."""
+        self._require_ready()
+        with get_session() as s:
+            open_count = s.execute(
+                select(func.count()).select_from(Record).where(Record.closed_at.is_(None))
+            ).scalar_one()
+        loaded = self.catalog.is_loaded
+        details: dict = {
+            "db_connected": True, "ready": True, "catalog_loaded": loaded,
+            "record_types": sorted(self.catalog.types()) if loaded else [],
+            "attachment_dir": str(self.attachment_dir), "open": open_count,
+        }
+        if not loaded:
+            return "error", {**details, "reason": "catalog_not_loaded"}
+        storage = self.storage_check()
+        details["attachment_storage"] = storage
+        if self.catalog_dir_missing:
+            details["catalog_dir_missing"] = self.catalog_dir_missing
+        problems = self.problems(storage)
+        self.sync_runtime_status(problems)
+        if problems:
+            return "degraded", {**details, "reason": problems[0], "problems": problems}
+        return "ok", details
+
+    def sync_runtime_status(self, problems: list[str] | None = None) -> None:
+        """Mirror problems into ``ctx.set_status`` (core API ≥ 1.5): a
+        non-blocking ``degraded`` banner while any exist, ``ready`` once they
+        are gone. Only phase/message changes are sent."""
+        if problems is None:
+            problems = self.problems(self.storage_check())
+        set_status = getattr(self._ctx, "set_status", None)
+        if not callable(set_status):
+            return
+        message = "; ".join(_PROBLEM_TEXT.get(p, p) for p in problems) or None
+        if message == self._status_message:
+            return
+        self._status_message = message
+        if message:
+            self._on_loop(functools.partial(set_status, "degraded", message=message, blocking=False))
+        else:
+            self._on_loop(functools.partial(set_status, "ready"))
+
     # ── Events ───────────────────────────────────────────────────────────────
 
     def _announce_entity(self, detail: dict) -> None:
@@ -748,20 +1031,33 @@ class ItsmService:
                 log.warning("ITSM: manifest lacks emit permission for entity_registry:register")
                 self._registry_warned = True
 
-    def _emit(self, topic: str, payload: dict) -> None:
+    def _emit(self, topic: str, payload: dict, *, cluster: bool = False) -> None:
+        """Emit on the bus; ``cluster=True`` also reaches the other core instances."""
         if not self._ctx:
             return
-        # Service methods run in to_thread workers; async bus subscribers need
-        # the loop thread, so marshal emits back onto it.
+        if cluster:
+            self._on_loop(functools.partial(self._emit_cluster, topic, payload))
+        else:
+            self._on_loop(functools.partial(self._ctx.emit, topic, payload))
+
+    def _emit_cluster(self, topic: str, payload: dict) -> None:
+        try:
+            self._ctx.emit(topic, payload, cluster=True)
+        except TypeError:  # core without cluster bus (API < 1.7): local only
+            self._ctx.emit(topic, payload)
+
+    def _on_loop(self, fn) -> None:
+        """Service methods run in to_thread workers; bus subscribers need the
+        loop thread, so marshal context calls back onto it."""
         try:
             running = asyncio.get_running_loop()
         except RuntimeError:
             running = None
         loop = self._loop
         if running is None and loop is not None and loop.is_running():
-            loop.call_soon_threadsafe(self._ctx.emit, topic, payload)
+            loop.call_soon_threadsafe(fn)
             return
-        self._ctx.emit(topic, payload)
+        fn()
 
 
 itsm_service = ItsmService()

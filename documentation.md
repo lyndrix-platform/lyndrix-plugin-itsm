@@ -176,7 +176,38 @@ Einstellungen).
 | `max_attachment_mb` | `25` | Größenlimit je Datei |
 | `catalog_dir` | leer (= mitgelieferter Katalog) | eigenes Verzeichnis mit `record_types/*.yml` — **ersetzt** den mitgelieferten Satz |
 
-Die Einstellungen werden nach `vault:ready_for_data` angewendet.
+Die Einstellungen werden nach `vault:ready_for_data` und bei jedem `plugin:settings_changed`
+(Core ≥ 1.5.1, wird an alle Instanzen verteilt) angewendet — Speichern im Settings-Dialog wirkt
+also sofort auf jeder Instanz. Ist `catalog_dir` gesetzt, aber auf dieser Instanz nicht vorhanden,
+bleibt der zuletzt geladene Katalog aktiv und `health()` meldet `degraded` (`catalog_dir_missing`).
+
+## Cluster-Betrieb (ab 0.2.0)
+
+Bei mehreren Core-Instanzen (`LYNDRIX_CLUSTER_MODE=cluster`) laufen alle Routen auf jeder Instanz
+gegen die gemeinsame MariaDB.
+
+- **Anhänge brauchen geteilten Speicher.** `attachment_dir` muss auf **allen** Instanzen dasselbe
+  Verzeichnis sein (RWX-Volume bzw. NFS-Mount, in k3s z. B. `/data/storage` als RWX-PVC). Sonst
+  fehlt eine über Instanz A hochgeladene Datei auf Instanz B (Download → 410). Ein Docker-Host-
+  Runner mit eigenem `/data/storage` teilt das Verzeichnis **nicht**.
+- **Erkennung:** Jede Instanz schreibt `<attachment_dir>/.cluster/<instance_id>`. Sieht eine Instanz
+  die Markierung mindestens einer anderen lebenden Instanz, gilt das Verzeichnis als geteilt.
+  Sind andere Instanzen aktiv, aber keine ihrer Markierungen sichtbar, melden `health()` und der
+  Runtime-Status `degraded` (`attachment_dir_not_shared`, Banner, nicht blockierend). Ohne
+  lebende Nachbarn bleibt der Zustand „unbekannt“ (kein `degraded`). Die Prüfung wird 60 s gecacht.
+- **Pfade:** `storage_path` wird seit 0.2.0 **relativ** zu `attachment_dir` gespeichert
+  (`<record>/<attachment>`); absolute Pfade älterer Datensätze werden weiterhin gelesen.
+- **Nummernvergabe** läuft in einer eigenen kurzen READ-COMMITTED-Transaktion
+  (`UPDATE … SET last_value = last_value + 1`); das Anlegen wird bei MariaDB 1020/1205/1213
+  wiederholt. Nummern sind eindeutig, aber nicht lückenlos.
+- **Optimistisches Sperren** über ein bedingtes `UPDATE … WHERE uuid = :u AND version = :v`.
+  Ein verlorenes Rennen (oder 1020/1205/1213) ergibt `VersionConflict` → HTTP 409; ohne
+  mitgeschickte `version` wird einmal mit frischen Daten wiederholt.
+- **Katalog:** `POST /catalog/reload` sendet `itsm:catalog_reloaded` mit `cluster=True`; die anderen
+  Instanzen laden ebenfalls neu.
+- **Bootstrap:** Tabellen entstehen unter `db_instance.advisory_lock("lyndrix_bootstrap")` im
+  Thread-Pool; „existiert bereits“ (1050/1060/1061) gilt als Erfolg, Fehlschläge werden wiederholt.
+- **`health()`** zählt nur offene Datensätze; Details je Typ/Priorität liefert `GET /stats`.
 
 ## Rollen
 

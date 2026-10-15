@@ -31,6 +31,10 @@ Events consumed
                         (UUID, scheme:value, 'docker-hydra', display name).
   Use ctx.request() for the round-trips; failures without a request_id are
   reported on itsm:ingest_failed.
+  plugin:settings_changed — core ≥ 1.5.1, bridged to every instance: settings
+                        of this plugin were saved → re-apply them here.
+  itsm:catalog_reloaded — a peer reloaded the catalog (payload["_origin"]) →
+                        reload ours.
 
 Events emitted
 --------------
@@ -39,15 +43,27 @@ Events emitted
   entity_registry:register — every new record becomes an itsm_record entity
   entity_registry:lookup   — request to resolve CI references for links
                              (reply: entity_registry:lookup_result)
+  itsm:catalog_reloaded    — cluster=True after POST /catalog/reload
+
+Cluster
+-------
+Routes run on every instance against the shared DB. The attachment directory
+must be shared storage (RWX/NFS); health() and the runtime status report
+``degraded`` when the other instances' markers are not visible in it.
 """
 import asyncio
 import time
-from pathlib import Path
 
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api import RecordCreate, build_plugin_router
-from .app.logic.service import ItsmError, NotFound, TransitionError, VersionConflict
+from .app.logic.service import (
+    CATALOG_RELOADED_TOPIC,
+    ItsmError,
+    NotFound,
+    TransitionError,
+    VersionConflict,
+)
 from .app.logic.service import itsm_service as svc
 
 PLUGIN_ID = "lyndrix.plugin.itsm"
@@ -57,7 +73,7 @@ PLUGIN_ID = "lyndrix.plugin.itsm"
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="IT Service Management",
-    version="0.1.0",
+    version="0.2.0",
     description=(
         "Incidents, changes, problems, requests and tasks with catalog-driven "
         "processes, audit journal, CI links and attachments. Native suite today, "
@@ -77,11 +93,13 @@ manifest = ModuleManifest(
          "sidebar_visible": True},
     ],
     # Operator settings — edited via the core's schema-driven settings modal,
-    # stored in Vault under plugins/<id>/settings, applied on vault:ready_for_data.
+    # stored in Vault under plugins/<id>/settings, applied on vault:ready_for_data
+    # and on plugin:settings_changed (every instance).
     settings_schema=[
         {"key": "attachment_dir", "label": "Attachment directory", "kind": "str",
          "category": "Attachments", "default": "/data/storage/itsm/attachments",
-         "description": "Where uploaded files are stored (inside the core's data volume)."},
+         "description": "Where uploaded files are stored (inside the core's data volume). "
+                        "In cluster mode this must be shared storage (RWX/NFS) mounted on every instance."},
         {"key": "max_attachment_mb", "label": "Max attachment size (MB)", "kind": "int",
          "category": "Attachments", "default": "25"},
         {"key": "catalog_dir", "label": "Catalog directory", "kind": "str",
@@ -92,6 +110,8 @@ manifest = ModuleManifest(
         "subscribe": [
             "db:connected",
             "vault:ready_for_data",
+            "plugin:settings_changed",
+            CATALOG_RELOADED_TOPIC,
             "itsm:record_create",
             "itsm:record_update",
             "itsm:transition",
@@ -114,6 +134,7 @@ manifest = ModuleManifest(
             "itsm:transition_result",
             "itsm:ci_link_result",
             "itsm:ingest_failed",
+            CATALOG_RELOADED_TOPIC,
             "entity_registry:register",
             "entity_registry:lookup",
         ],
@@ -158,36 +179,14 @@ async def health(ctx) -> PluginHealthStatus:
     if not svc.is_ready:
         return PluginHealthStatus(status="error", details={"reason": "tables_not_initialized"})
     try:
-        stats = await asyncio.to_thread(svc.get_stats)
+        status, details = await asyncio.to_thread(svc.health_report)
     except Exception as exc:
         return PluginHealthStatus(
             status="error", details={"reason": "db_query_failed", "error": str(exc)},
             latency_ms=round((time.perf_counter() - start) * 1000, 1),
         )
-    details = {"db_connected": True, "ready": True, "catalog_loaded": svc.catalog.is_loaded,
-               "record_types": sorted(svc.catalog.types()) if svc.catalog.is_loaded else [],
-               "attachment_dir": str(svc.attachment_dir), **stats}
-    latency = round((time.perf_counter() - start) * 1000, 1)
-    if not svc.catalog.is_loaded:
-        return PluginHealthStatus(status="error", details={**details, "reason": "catalog_not_loaded"},
-                                  latency_ms=latency)
-    writable = await asyncio.to_thread(_dir_writable, svc.attachment_dir)
-    if not writable:
-        return PluginHealthStatus(status="degraded",
-                                  details={**details, "reason": "attachment_dir_not_writable"},
-                                  latency_ms=latency)
-    return PluginHealthStatus(status="ok", details=details, latency_ms=latency)
-
-
-def _dir_writable(path: Path) -> bool:
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        probe = path / ".write_probe"
-        probe.write_bytes(b"")
-        probe.unlink()
-        return True
-    except OSError:
-        return False
+    return PluginHealthStatus(status=status, details=details,
+                              latency_ms=round((time.perf_counter() - start) * 1000, 1))
 
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
@@ -198,47 +197,53 @@ def setup(ctx):
     svc.catalog.load()  # fail loudly on a broken shipped catalog
     ctx.register_routes(build_plugin_router(svc))
 
-    def _db_init(reason: str) -> None:
-        try:
-            svc.on_db_connected()
-            ctx.log.info(f"ITSM: tables ready ({reason})")
-        except Exception as exc:
-            ctx.log.error(f"ITSM: DB init failed — {exc}")
-
+    # DDL runs off-loop under the core bootstrap lock (see app/model/database.py).
     if db_instance.is_connected:
-        _db_init("DB already connected")
+        ctx.create_task(svc.init_db("DB already connected"), name="itsm:db_init")
 
     @ctx.subscribe("db:connected")
     async def _on_db_connected(payload):
-        _db_init("db:connected")
+        await svc.init_db("db:connected")
 
     # ── Settings (Vault-backed, schema in manifest) ──────────────────────────
-    def _apply_settings() -> None:
-        settings = ctx.get_all_settings() or {}
-        att_dir = (settings.get("attachment_dir") or "").strip()
-        if att_dir:
-            svc.attachment_dir = Path(att_dir)
+    async def _apply_settings(reason: str) -> None:
+        def _run() -> None:  # Vault + disk I/O are blocking
+            svc.apply_settings(ctx.get_all_settings() or {})
+            svc.storage_check(force=True)  # writes this instance's cluster marker
+            svc.sync_runtime_status()
         try:
-            mb = int(settings.get("max_attachment_mb") or 0)
-            if mb > 0:
-                svc.max_attachment_bytes = mb * 1024 * 1024
-        except (TypeError, ValueError):
-            ctx.log.warning("ITSM: max_attachment_mb is not an integer — keeping default")
-        cat_dir = (settings.get("catalog_dir") or "").strip()
-        if cat_dir:
-            if Path(cat_dir).is_dir():
-                svc.set_catalog_dir(cat_dir)
-                svc.reload_catalog()
-                ctx.log.info(f"ITSM: using operator catalog at {cat_dir}")
-            else:
-                ctx.log.warning(f"ITSM: catalog_dir '{cat_dir}' not found — keeping built-in catalog")
+            await asyncio.to_thread(_run)
+        except Exception as exc:
+            ctx.log.warning(f"ITSM: could not apply settings ({reason}) — {exc}")
 
     @ctx.subscribe("vault:ready_for_data")
     async def _on_vault_ready(payload):
+        await _apply_settings("vault:ready_for_data")
+
+    @ctx.subscribe("plugin:settings_changed")
+    async def _on_settings_changed(payload):
+        if isinstance(payload, dict) and payload.get("plugin_id") == PLUGIN_ID:
+            await _apply_settings("plugin:settings_changed")
+
+    @ctx.subscribe(CATALOG_RELOADED_TOPIC)
+    async def _on_catalog_reloaded(payload):
+        # Our own announcement has no _origin — that reload already happened.
+        if not isinstance(payload, dict) or not payload.get("_origin"):
+            return
         try:
-            await asyncio.to_thread(_apply_settings)  # Vault I/O is blocking
+            await asyncio.to_thread(svc.reload_catalog)
+            ctx.log.info(f"ITSM: catalog reloaded (peer {payload['_origin']})")
         except Exception as exc:
-            ctx.log.warning(f"ITSM: could not apply settings — {exc}")
+            ctx.log.error(f"ITSM: catalog reload from peer failed — {exc}")
+
+    # Announce this instance in the attachment dir right away (cluster sharing check).
+    async def _initial_storage_check() -> None:
+        try:
+            await asyncio.to_thread(lambda: (svc.storage_check(force=True), svc.sync_runtime_status()))
+        except Exception as exc:
+            ctx.log.debug(f"ITSM: initial storage check failed — {exc}")
+
+    ctx.create_task(_initial_storage_check(), name="itsm:storage_check")
 
     # ── Inbound bus API ──────────────────────────────────────────────────────
     def _fail(topic: str, error: str) -> None:
