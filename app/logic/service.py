@@ -15,6 +15,7 @@ entity_registry:register — every new record is announced as an itsm_record
 entity_registry:lookup   — request (via ctx.request) to resolve a CI reference
                             for a CI link; reply on entity_registry:lookup_result
 itsm:catalog_reloaded    — {reloaded_at}, cluster=True, after an operator reload
+itsm:ingest_failed       — {topic, error} when a bus payload was rejected
 
 Cluster (core API ≥ 1.7)
 ------------------------
@@ -50,6 +51,7 @@ from .catalog import (
     CatalogLoader,
     RecordTypeDef,
 )
+from .texts import Texts
 
 log = get_logger("Plugin:ITSM:Service")
 
@@ -78,6 +80,14 @@ _UPDATABLE = (
 
 class ItsmError(ValueError):
     """Invalid input → HTTP 400."""
+
+
+class DuplicateRecord(ItsmError):
+    """A record with this ``(source, external_id)`` already exists → HTTP 400.
+
+    Raised both by the pre-check and when the DB unique key rejects a
+    concurrent insert, so an ingest handler can treat "a peer won" as success.
+    """
 
 
 class NotFound(LookupError):
@@ -122,6 +132,9 @@ class ItsmService:
         self.max_attachment_bytes = 25 * 1024 * 1024
         self.allowed_mime: tuple[str, ...] = att.DEFAULT_ALLOWED_MIME
         self._registry_warned = False
+        # Texts of records the plugin writes itself (incidents from monitoring
+        # outages, tasks from maintenance events) — locale via setting auto_text_locale.
+        self.texts = Texts()
         # Operator catalog_dir that does not exist on this instance (health → degraded).
         self.catalog_dir_missing: str | None = None
         self._storage_cache: tuple[float, dict] | None = None
@@ -191,6 +204,9 @@ class ItsmService:
                 self.max_attachment_bytes = mb * 1024 * 1024
         except (TypeError, ValueError):
             log.warning("ITSM: max_attachment_mb is not an integer — keeping the current limit")
+        locale = str(settings.get("auto_text_locale") or "").strip()
+        if locale and not self.texts.set_locale(locale):
+            log.warning(f"ITSM: auto_text_locale '{locale}' has no locale file — keeping '{self.texts.locale}'")
         cat_dir = str(settings.get("catalog_dir") or "").strip()
         if cat_dir:
             if Path(cat_dir).is_dir():
@@ -411,7 +427,7 @@ class ItsmService:
                 if source and s.execute(
                     select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
                 ).scalar_one_or_none():
-                    raise ItsmError(f"Record {source}/{external_id} already exists")
+                    raise DuplicateRecord(f"Record {source}/{external_id} already exists")
                 number = self._allocate_number(rt)
                 rec = Record(
                     uuid=str(uuid4()), number=number, record_type=rt.id,
@@ -446,7 +462,7 @@ class ItsmService:
                 # MariaDB names the constraint; SQLite lists the columns.
                 msg = str(exc.orig)
                 if source and ("uq_itsm_source_ext" in msg or "external_id" in msg):
-                    raise ItsmError(f"Record {source}/{external_id} already exists") from exc
+                    raise DuplicateRecord(f"Record {source}/{external_id} already exists") from exc
                 if attempt == 2:
                     raise
                 # number collision (e.g. counter behind imported rows) — next number
@@ -461,6 +477,42 @@ class ItsmService:
         with get_session() as s:
             rec = self._get(s, ref)
             return self._detail(s, rec) if rec else None
+
+    # ── Lookups for ingest handlers (dedupe) ─────────────────────────────────
+
+    def open_state_names(self, record_type: str) -> list[str]:
+        """State ids of kind ``open`` for a record type — "open" for dedupe
+        purposes (``closed_at IS NULL`` would also match ``resolved``)."""
+        rt = self.catalog.record_type(record_type)
+        return [s.id for s in rt.states if s.kind == "open"]
+
+    def find_by_external(self, source: str, external_id: str) -> dict | None:
+        """The record pushed in under ``(source, external_id)`` (summary dict), or None."""
+        self._require_ready()
+        with get_session() as s:
+            rec = s.execute(
+                select(Record).where(Record.source == source, Record.external_id == external_id)
+            ).scalar_one_or_none()
+            return rec.to_dict() if rec else None
+
+    def find_open_for_ci(self, ci_id: str, *, record_type: str, source: str | None = None,
+                         role: str = "affected") -> dict | None:
+        """Most recent record of ``record_type`` in an *open* state that links
+        the configuration item ``ci_id`` with ``role`` (optionally only records
+        of one ``source``). Summary dict or None."""
+        self._require_ready()
+        states = self.open_state_names(record_type)
+        with get_session() as s:
+            stmt = (
+                select(Record)
+                .join(CiLink, CiLink.record_uuid == Record.uuid)
+                .where(CiLink.entity_uuid == ci_id, CiLink.role == role,
+                       Record.record_type == record_type, Record.state.in_(states))
+            )
+            if source:
+                stmt = stmt.where(Record.source == source)
+            rec = s.execute(stmt.order_by(Record.opened_at.desc()).limit(1)).scalars().first()
+            return rec.to_dict() if rec else None
 
     def list_records(
         self, *, record_type: str | None = None, state: str | None = None,
@@ -1013,6 +1065,12 @@ class ItsmService:
             self._on_loop(functools.partial(set_status, "ready"))
 
     # ── Events ───────────────────────────────────────────────────────────────
+
+    def report_ingest_failure(self, topic: str, error: str) -> None:
+        """A bus payload was rejected: log it and announce ``itsm:ingest_failed``
+        so the emitter (or an operator dashboard) can see what went wrong."""
+        log.warning(f"ITSM: {topic} rejected — {error}")
+        self._emit("itsm:ingest_failed", {"topic": topic, "error": error})
 
     def _announce_entity(self, detail: dict) -> None:
         """Register the record as an itsm_record entity (best effort)."""

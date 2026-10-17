@@ -44,7 +44,26 @@
     "empty": "No records match.",
     "shown": "{{shown}} of {{total}}",
     "ciFilter": "Configuration item",
-    "ciFilterClear": "Remove CI filter"
+    "ciFilterClear": "Remove CI filter",
+    "autoOnly": "automatic only"
+  },
+  "tag": {
+    "auto": "automatic",
+    "autoHint": "Opened by the plugin itself — from a monitoring outage or a maintenance event"
+  },
+  "auto": {
+    "incident_title": "{{name}}: unreachable since {{since}}",
+    "incident_description": "Opened automatically from monitoring.\n\nMonitor: {{monitor_id}}\nConfiguration item: {{name}} ({{kind}}, {{ci_id}})\nHost: {{host}}\nDown since: {{since}} — reported {{persisted_at}} after {{duration}}\nRule: offline_minutes={{offline_minutes}}, severity={{severity}}, auto_resolve={{auto_resolve}}\nLast error: {{error}}",
+    "outage_repeated": "Another outage reported: {{name}}, since {{since}}, duration {{duration}} (outage {{outage_id}}).",
+    "recovered_note": "Monitor back up at {{recovered_at}}, outage duration {{duration}}.",
+    "resolution_notes": "Resolved automatically: monitor back up at {{recovered_at}}, outage duration {{duration}}.",
+    "recovered_no_auto_resolve": "Monitor back up at {{recovered_at}}, outage duration {{duration}}. Not resolved automatically (auto_resolve is off) — please verify and resolve manually.",
+    "recovered_blocked": "Monitor back up at {{recovered_at}}, outage duration {{duration}}. Not resolved automatically: no transition to \"resolved\" is allowed from state \"{{state}}\".",
+    "recovered_additional": "Additional outage ended: from {{since}} until {{recovered_at}}, duration {{duration}} (outage {{outage_id}}).",
+    "task_title": "Define a maintenance window: {{name}}",
+    "task_description": "Service {{name}} ({{site}}/{{stage}}) has deploy_policy: window, but no maintenance window lies within the horizon of {{horizon_days}} days. Deploy job {{job_id}} therefore ran at once on {{detected_at}}.\n\nReason: {{reason}}\n\nPlease define a window — in the service's service.yml (maintenance.windows, per stage via stage_overrides) or in the iac-controller (hosts.yml: the host's windows with inherit, or the stage's stage_vars.maintenance_default). Details: IaC orchestrator documentation, section maintenance windows.",
+    "task_repeated": "Another deploy without a maintenance window: job {{job_id}} on {{detected_at}} ({{site}}/{{stage}}).",
+    "notify_created_title": "Incident {{number}} opened automatically"
   },
   "create": {
     "new": "New record",

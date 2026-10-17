@@ -8,7 +8,11 @@ mode: native
 description: Work item, typically linked as a child of an incident, change or problem.
 
 subtypes: []
-categories: []
+# An empty list would accept any category; once a list exists only its ids are
+# valid (a task without a category stays fine).
+categories:
+  # Tasks the plugin opens from maintenance:window_missing ("define a maintenance window").
+  - {id: maintenance, label: Maintenance window}
 
 priority:
   impact:
@@ -48,6 +52,9 @@ transitions:
 
 fields:
   - {id: due, label: Due, kind: datetime}
+  # Origin of a task opened from a bus event (e.g. window_missing:<ci_id>:<job_id>).
+  - {id: source_ref, label: Source reference, kind: text,
+     description: "Id of the event this task was opened for"}
 
 assignment_groups:
   - {id: infra, label: Infrastructure, core_group: INT_ADMIN}

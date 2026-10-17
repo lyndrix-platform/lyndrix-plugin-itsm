@@ -12,6 +12,10 @@ Architecture
                                 Attachment / Counter
   app/logic/catalog.py        — validated catalog loader
   app/logic/service.py        — CRUD, transitions, journal, links, attachments
+  app/logic/ingest.py         — base of the bus-event ingest handlers (dedupe,
+                                CI links, race handling, ingest_failed)
+  app/logic/monitoring_incidents.py — monitoring outages → incidents / auto-resolve
+  app/logic/maintenance_tasks.py    — missing maintenance window → task
   app/logic/connectors/       — ConnectorAdapter seam (gateway mode, later)
   app/api/__init__.py         — REST router (both UIs use only this)
   app/ui/react/               — React UI (bundle → app/ui/static/ui_bundle.js)
@@ -35,11 +39,23 @@ Events consumed
                         of this plugin were saved → re-apply them here.
   itsm:catalog_reloaded — a peer reloaded the catalog (payload["_origin"]) →
                         reload ours.
+  monitoring:outage_persisted / monitoring:outage_recovered — maintenance-
+                        windows contract (core docs/plugins.md → Maintenance
+                        windows): an outage outside a window opens an incident
+                        (source=monitoring, external_id=outage_id, priority from
+                        the rule's severity), the recovery auto-resolves it with
+                        resolution_code auto_recovered or leaves a comment.
+  maintenance:window_missing — a deploy_policy: window deploy ran without a
+                        window in the horizon → task "define a maintenance
+                        window" (source=maintenance, external_id=event_id).
+  Payloads are parsed here (no dependency on core.api.maintenance), handlers
+  are idempotent (UNIQUE(source, external_id) + "open record per CI").
 
 Events emitted
 --------------
   itsm:record_created / itsm:record_updated / itsm:state_changed /
   itsm:journal_added  — broadcasts (see app/logic/service.py)
+  itsm:ingest_failed  — {topic, error} for a rejected bus payload
   entity_registry:register — every new record becomes an itsm_record entity
   entity_registry:lookup   — request to resolve CI references for links
                              (reply: entity_registry:lookup_result)
@@ -57,6 +73,7 @@ import time
 from core.api import ModuleManifest, PluginHealthStatus, db_instance
 
 from .app.api import RecordCreate, build_plugin_router
+from .app.logic import maintenance_tasks, monitoring_incidents
 from .app.logic.service import (
     CATALOG_RELOADED_TOPIC,
     ItsmError,
@@ -67,13 +84,14 @@ from .app.logic.service import (
 from .app.logic.service import itsm_service as svc
 
 PLUGIN_ID = "lyndrix.plugin.itsm"
+UI_RECORD_LINK = "/apps/lyndrix-plugin-itsm/itsm?record="
 
 # ── Manifest ──────────────────────────────────────────────────────────────────
 
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="IT Service Management",
-    version="0.2.0",
+    version="0.3.0",
     description=(
         "Incidents, changes, problems, requests and tasks with catalog-driven "
         "processes, audit journal, CI links and attachments. Native suite today, "
@@ -105,6 +123,10 @@ manifest = ModuleManifest(
         {"key": "catalog_dir", "label": "Catalog directory", "kind": "str",
          "category": "Processes", "default": "",
          "description": "Optional: directory with your own record_types/*.yml (replaces the shipped set). Empty = built-in catalog."},
+        {"key": "auto_text_locale", "label": "Language of generated texts", "kind": "select",
+         "options": ["de", "en"], "category": "Automation", "default": "de",
+         "description": "Titles, descriptions and journal entries of records the plugin opens itself "
+                        "(incidents from monitoring outages, tasks from maintenance events)."},
     ],
     permissions={
         "subscribe": [
@@ -119,7 +141,12 @@ manifest = ModuleManifest(
             "itsm:ci_link",
             # Reply topic of our entity_registry:lookup requests.
             "entity_registry:lookup_result",
+            # Maintenance-windows contract: outages → incidents, missing window → task.
+            monitoring_incidents.TOPIC_PERSISTED,
+            monitoring_incidents.TOPIC_RECOVERED,
+            maintenance_tasks.TOPIC_WINDOW_MISSING,
             # Own broadcasts, consumed for notification routing.
+            "itsm:record_created",
             "itsm:record_updated",
             "itsm:state_changed",
             "itsm:journal_added",
@@ -140,6 +167,9 @@ manifest = ModuleManifest(
         ],
     },
     notification_endpoints=[
+        {"name": "record_created",
+         "description": "A P1/P2 incident was opened automatically (monitoring outage)",
+         "default_active": True, "internal_toast": True, "internal_persist": True},
         {"name": "record_assigned", "description": "A record was assigned to someone",
          "default_active": True, "internal_toast": True, "internal_persist": True},
         {"name": "record_state_changed", "description": "A record changed state",
@@ -247,8 +277,7 @@ def setup(ctx):
 
     # ── Inbound bus API ──────────────────────────────────────────────────────
     def _fail(topic: str, error: str) -> None:
-        ctx.log.warning(f"ITSM: {topic} rejected — {error}")
-        ctx.emit("itsm:ingest_failed", {"topic": topic, "error": error})
+        svc.report_ingest_failure(topic, error)
 
     def _reply(reply_topic: str, request_id, **kw) -> None:
         if request_id is not None:
@@ -358,16 +387,45 @@ def setup(ctx):
         except Exception as exc:
             ctx.log.error(f"ITSM: journal_add failed — {exc}")
 
+    # ── Maintenance-windows contract (other plugins' events → records) ───────
+    # The handlers never raise: rejected payloads land on itsm:ingest_failed.
+    incidents = monitoring_incidents.MonitoringIncidents(svc)
+    tasks = maintenance_tasks.MaintenanceTasks(svc)
+
+    @ctx.subscribe(monitoring_incidents.TOPIC_PERSISTED)
+    async def _on_outage_persisted(payload):
+        await incidents.handle_outage_persisted(payload)
+
+    @ctx.subscribe(monitoring_incidents.TOPIC_RECOVERED)
+    async def _on_outage_recovered(payload):
+        await incidents.handle_outage_recovered(payload)
+
+    @ctx.subscribe(maintenance_tasks.TOPIC_WINDOW_MISSING)
+    async def _on_window_missing(payload):
+        await tasks.handle_window_missing(payload)
+
     # ── Notifications (routed by core per user preferences) ──────────────────
-    def _notify(endpoint: str, record: dict, title: str, body: str, severity: str = "info") -> None:
+    def _notify(endpoint: str, record: dict, title: str, body: str, severity: str = "info", **extra) -> None:
         try:
             ctx.notify(endpoint, {"record_uuid": record.get("uuid"), "number": record.get("number"),
                                   "record_type": record.get("record_type"), "state": record.get("state"),
-                                  "priority": record.get("priority")},
+                                  "priority": record.get("priority"), **extra},
                        notification_id=f"itsm:{record.get('uuid')}:{endpoint}",
                        title=title, body=body, severity=severity)
         except Exception as exc:
             ctx.log.debug(f"ITSM: notify {endpoint} failed — {exc}")
+
+    @ctx.subscribe("itsm:record_created")
+    async def _notify_created(payload):
+        """Only incidents the plugin opened itself from a monitoring outage, and
+        only P1/P2 — a manually created record stays silent on create."""
+        record = (payload or {}).get("record") or {}
+        if record.get("source") != monitoring_incidents.SOURCE or record.get("priority") not in ("P1", "P2"):
+            return
+        _notify("record_created", record,
+                svc.texts("notify_created_title", number=record.get("number")),
+                record.get("title") or "", "warning",
+                link=f"{UI_RECORD_LINK}{record.get('uuid')}")
 
     @ctx.subscribe("itsm:record_updated")
     async def _notify_assigned(payload):

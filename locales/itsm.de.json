@@ -44,7 +44,26 @@
     "empty": "Keine passenden Datensätze.",
     "shown": "{{shown}} von {{total}}",
     "ciFilter": "Configuration Item",
-    "ciFilterClear": "CI-Filter entfernen"
+    "ciFilterClear": "CI-Filter entfernen",
+    "autoOnly": "nur automatische"
+  },
+  "tag": {
+    "auto": "automatisch",
+    "autoHint": "Vom Plugin selbst angelegt — aus einem Monitoring-Ausfall oder einem Wartungs-Ereignis"
+  },
+  "auto": {
+    "incident_title": "{{name}}: nicht erreichbar seit {{since}}",
+    "incident_description": "Automatisch aus dem Monitoring angelegt.\n\nMonitor: {{monitor_id}}\nConfiguration Item: {{name}} ({{kind}}, {{ci_id}})\nHost: {{host}}\nAusfall seit: {{since}} — gemeldet {{persisted_at}} nach {{duration}}\nRegel: offline_minutes={{offline_minutes}}, severity={{severity}}, auto_resolve={{auto_resolve}}\nLetzter Fehler: {{error}}",
+    "outage_repeated": "Erneuter Ausfall gemeldet: {{name}}, seit {{since}}, Dauer {{duration}} (Outage {{outage_id}}).",
+    "recovered_note": "Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}.",
+    "resolution_notes": "Automatisch gelöst: Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}.",
+    "recovered_no_auto_resolve": "Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}. Kein automatisches Lösen (auto_resolve ist aus) — bitte prüfen und manuell lösen.",
+    "recovered_blocked": "Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}. Nicht automatisch gelöst: aus dem Status „{{state}}“ ist kein Übergang nach „gelöst“ erlaubt.",
+    "recovered_additional": "Weiterer Ausfall beendet: seit {{since}} bis {{recovered_at}}, Dauer {{duration}} (Outage {{outage_id}}).",
+    "task_title": "Wartungsfenster definieren: {{name}}",
+    "task_description": "Der Service {{name}} ({{site}}/{{stage}}) hat deploy_policy: window, aber im Horizont von {{horizon_days}} Tagen lag kein Wartungsfenster. Der Deploy-Job {{job_id}} lief deshalb am {{detected_at}} sofort.\n\nGrund: {{reason}}\n\nBitte ein Fenster definieren — in der service.yml des Services (maintenance.windows, je Stage über stage_overrides) oder im iac-controller (hosts.yml: Fenster des Hosts mit inherit, oder stage_vars.maintenance_default der Stage). Details: Dokumentation des IaC-Orchestrators, Abschnitt Wartungsfenster.",
+    "task_repeated": "Erneuter Deploy ohne Wartungsfenster: Job {{job_id}} am {{detected_at}} ({{site}}/{{stage}}).",
+    "notify_created_title": "Incident {{number}} automatisch angelegt"
   },
   "create": {
     "new": "Neuer Datensatz",

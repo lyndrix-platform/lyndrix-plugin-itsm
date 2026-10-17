@@ -102,10 +102,21 @@ fields:
       - {id: no_fault_found, label: No fault found}
       - {id: duplicate, label: Duplicate}
       - {id: cannot_reproduce, label: Cannot reproduce}
+      # Set by the plugin itself when the monitor that opened the incident is back.
+      - {id: auto_recovered, label: Auto-recovered (monitor back up)}
   - {id: resolution_notes, label: Resolution notes, kind: text, multiline: true}
   - {id: cancel_reason, label: Cancel reason, kind: text}
   - {id: affected_users, label: Affected users (count), kind: int}
   - {id: security_relevant, label: Security relevant, kind: bool}
+  # Filled by incidents opened from monitoring:outage_persisted (tag "auto"):
+  # the incident rule as JSON, the deterministic outage id (= external_id) and
+  # the Entity Registry kind of the affected CI.
+  - {id: monitor_rule, label: Monitor rule (JSON), kind: text, multiline: true,
+     description: "Incident rule of the monitor at the time of the outage: offline_minutes, severity, auto_resolve"}
+  - {id: outage_id, label: Outage id, kind: text,
+     description: "Monitoring outage this incident was opened for (<ci_id>:<since>)"}
+  - {id: ci_kind, label: CI kind, kind: text,
+     description: "Entity Registry kind of the affected configuration item (host, service, hypervisor, …)"}
 
 assignment_groups:
   - {id: service_desk, label: Service Desk}

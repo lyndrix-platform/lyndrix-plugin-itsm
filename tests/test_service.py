@@ -1,47 +1,12 @@
-"""ITSM service tests — real service against in-memory SQLite + shipped catalog."""
+"""ITSM service tests — real service against in-memory SQLite + shipped catalog
+(fixture ``svc`` in conftest.py, test doubles in fakes.py)."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine, event
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
-
-
-class _FakeCtx:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, dict]] = []
-        self.cluster_topics: list[str] = []
-
-    def emit(self, topic, payload, cluster=False):
-        self.events.append((topic, payload))
-        if cluster:
-            self.cluster_topics.append(topic)
-
-    def topics(self) -> list[str]:
-        return [t for t, _ in self.events]
-
-
-@pytest.fixture()
-def svc(monkeypatch, tmp_path):
-    from app.logic.service import ItsmService
-    from app.model import database
-
-    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-    # Enforce FKs like MariaDB does, so flush-order bugs fail here too.
-    event.listen(engine, "connect", lambda conn, _rec: conn.execute("PRAGMA foreign_keys=ON"))
-    monkeypatch.setattr(
-        database, "db_instance",
-        SimpleNamespace(engine=engine, SessionLocal=sessionmaker(bind=engine), is_connected=True),
-    )
-    service = ItsmService()
-    service.attachment_dir = tmp_path / "att"
-    service.set_context(_FakeCtx())
-    service.catalog.load()
-    service.on_db_connected()
-    return service
+from fakes import HYDRA, MERGED_AWAY, FakeCtx as _FakeCtx, registry as _registry
 
 
 def _inc(svc, **extra):
@@ -332,45 +297,6 @@ def test_get_by_number_and_unknown(svc):
 
 
 # ── CI resolution through the Entity Registry ─────────────────────────────────
-
-import asyncio  # noqa: E402
-
-HYDRA = "60c443da-a68e-4ba2-8925-aa934ca5dca0"
-MERGED_AWAY = "11111111-1111-1111-1111-111111111111"
-
-
-class _RegistryCtx(_FakeCtx):
-    """Fake ctx.request answering like the Entity Registry's lookup handler."""
-
-    def __init__(self, known: dict[str, dict] | None = None, available: bool = True) -> None:
-        super().__init__()
-        self.known = known or {}
-        self.available = available
-        self.requests: list[tuple[str, dict]] = []
-
-    async def request(self, topic, payload, *, reply_topic, timeout=10.0):
-        self.requests.append((topic, payload))
-        if not self.available:
-            return None  # nobody answered within the timeout
-        ref = payload["ref"]
-        hit = self.known.get(ref) or self.known.get(ref.lower())
-        if hit:
-            return {"ok": True, "entity": hit, "match": "identifier", "candidates": []}
-        cands = [e for k, e in self.known.items() if ref.lower() in k.lower()]
-        return {"ok": True, "entity": None, "match": "ambiguous" if len(cands) > 1 else None,
-                "candidates": cands}
-
-
-def _registry(svc, available=True):
-    hydra = {"uuid": HYDRA, "entity_type": "host", "display_name": "docker-hydra"}
-    ctx = _RegistryCtx({"docker-hydra": hydra, HYDRA: hydra, "iac.host:docker-hydra": hydra,
-                        MERGED_AWAY: hydra,
-                        "docker-atlas": {"uuid": "a" * 8 + "-0000-0000-0000-" + "0" * 12,
-                                         "entity_type": "host", "display_name": "docker-atlas"}},
-                      available=available)
-    svc.set_context(ctx)
-    return ctx
-
 
 def test_resolve_ci_links_by_name_fills_uuid_and_cache(svc):
     _registry(svc)

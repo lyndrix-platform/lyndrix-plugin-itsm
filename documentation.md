@@ -25,6 +25,10 @@ app/model/models.py          # Record / JournalEntry / CiLink / RecordLink / Att
 app/model/database.py        # Session-Helfer + Tabellen-Bootstrap (handgeschriebene Migration)
 app/logic/catalog.py         # validierter Katalog-Loader (pydantic, Querverweis-Prüfung)
 app/logic/service.py         # CRUD, Übergänge, Journal, Verknüpfungen, Anhänge, Events
+app/logic/ingest.py          # Basis der Bus-Event-Handler (Dedupe, CI-Links, Race-Behandlung, ingest_failed)
+app/logic/monitoring_incidents.py  # Monitoring-Ausfälle → Incidents / Auto-Resolve
+app/logic/maintenance_tasks.py     # fehlendes Wartungsfenster → Task
+app/logic/texts.py           # generierte Texte aus locales/itsm.<locale>.json (Abschnitt auto)
 app/logic/attachments.py     # Dateiablage (UUID-Dateinamen, kein Path-Traversal)
 app/logic/connectors/        # ConnectorAdapter-Schnittstelle (Gateway-Betrieb, spätere Phase)
 app/api/__init__.py          # REST-Router — beide UIs nutzen nur diesen
@@ -101,6 +105,16 @@ Mitgeliefert: `incident`, `change` (standard/normal/emergency, Risiko, Plan-/Rol
 Status `approval` als Platzhalter für die spätere Freigabe-Logik), `problem` (Known Error),
 `request`, `task`.
 
+Felder, die das Plugin selbst befüllt (Abschnitte *Automatische Incidents* und *Tasks aus
+Wartungs-Ereignissen*): `incident` hat den Lösungscode `auto_recovered` und die Custom Fields
+`monitor_rule` (Regel als JSON), `outage_id`, `ci_kind`; `task` hat die Kategorie `maintenance`
+und das Custom Field `source_ref`. Ein eigener Katalog (`catalog_dir`) sollte sie behalten —
+fehlt `auto_recovered`, hinterlässt das Auto-Resolve nur einen Kommentar.
+
+**Hinweis zu Kategorien:** eine leere `categories`-Liste erlaubt jede Kategorie; sobald die
+Liste Einträge hat (seit 0.3.0 bei `task`), sind nur noch diese IDs gültig — ein Datensatz ohne
+Kategorie bleibt erlaubt.
+
 ## REST-API
 
 Basis: `/api/plugins/lyndrix.plugin.itsm/`. Rechte: `plugin:lyndrix.plugin.itsm:api:read`,
@@ -151,22 +165,117 @@ weiterhin akzeptiert (mit dem mitgegebenen Namen), ein Name allein nicht. Die Li
 | `itsm:ci_link` | `{ref, ci \| entity_uuid, role?, author, request_id?}` — `ci` ist jede Referenz, die die Registry auflöst (`docker-hydra`, UUID, `schema:wert`) | `itsm:ci_link_result {request_id, ok, record, ci}` |
 
 Mit `ctx.request(...)` (Core-API ≥ 1.4) werden daraus Round-Trips; Fehler ohne `request_id`
-landen auf `itsm:ingest_failed`. Darüber werden später das Event-Management (Alarm → Incident,
-Alarm-Hostname → `itsm:ci_link`) und die IaC-Change-Brücke (Prod-Deploy → Change-Freigabe)
-angebunden.
+landen auf `itsm:ingest_failed`. Darüber wird später die IaC-Change-Brücke (Prod-Deploy →
+Change-Freigabe) angebunden.
+
+Ereignisse anderer Plugins aus dem Wartungsfenster-Vertrag (Core `docs/plugins.md` →
+*Maintenance windows*), die das Plugin **ohne** Request/Reply in Datensätze verwandelt:
+
+| Topic | Emitter | Wirkung |
+|---|---|---|
+| `monitoring:outage_persisted` | Monitoring, einmal je Ausfall | Incident anlegen (siehe *Automatische Incidents*) |
+| `monitoring:outage_recovered` | Monitoring | Incident automatisch lösen oder kommentieren |
+| `maintenance:window_missing` | IaC-Orchestrator | Task „Wartungsfenster definieren“ (siehe *Tasks aus Wartungs-Ereignissen*) |
+
+Ungültige Payloads (fehlende Pflichtfelder, `ci_id` ohne 36 Zeichen) werden auf
+`itsm:ingest_failed {topic, error}` gemeldet, nie als Exception. Kommt ein Ereignis während des
+Boots an, bevor die Tabellen bereit sind, wartet der Handler bis zu 30 s.
 
 ### Emittiert
 
 `itsm:record_created {record}`, `itsm:record_updated {record, changes}`,
 `itsm:state_changed {record, from_state, to_state}`, `itsm:journal_added {record_uuid, number,
-entry}`, `itsm:ci_link_result` (Antwort), `entity_registry:register` sowie
-`entity_registry:lookup` (Request zur CI-Auflösung, Antwort auf `entity_registry:lookup_result`).
+entry}`, `itsm:ingest_failed {topic, error}`, `itsm:ci_link_result` (Antwort),
+`entity_registry:register` sowie `entity_registry:lookup` (Request zur CI-Auflösung, Antwort auf
+`entity_registry:lookup_result`).
 
 ### Benachrichtigungen
 
-Endpunkte `record_assigned`, `record_state_changed`, `record_commented` werden über den
+Endpunkte `record_created` (nur automatisch angelegte P1/P2-Incidents, Payload mit `link` auf den
+Datensatz), `record_assigned`, `record_state_changed`, `record_commented` werden über den
 Core-Notification-Router ausgeliefert (Benutzer steuern Toast/Verlauf/externe Kanäle in den
-Einstellungen).
+Einstellungen). Manuell angelegte Datensätze erzeugen beim Anlegen keine Meldung.
+
+## Automatische Incidents aus dem Monitoring (ab 0.3.0)
+
+Das Monitoring-Plugin meldet einen Ausfall **einmal**, wenn ein Configuration Item außerhalb
+eines Wartungsfensters länger als die `offline_minutes` seiner Incident-Regel nicht erreichbar
+ist (`monitoring:outage_persisted`), und einmal, wenn der Monitor wieder antwortet
+(`monitoring:outage_recovered`). Das ITSM-Plugin braucht dafür keine Konfiguration — die Regel
+(`offline_minutes`, `severity`, `auto_resolve`) kommt aus `service.yml` bzw. den
+`incident_defaults` des iac-controllers und reist im Ereignis mit.
+
+**Payload `outage_persisted`:** `{outage_id, ci_id, kind, name, host_ci_id?, monitor_id, since,
+persisted_at, duration_s, rule: {offline_minutes, severity, auto_resolve}, error?}`;
+`outage_id = "<ci_id>:<since>"` ist deterministisch und wird als `external_id` gespeichert.
+
+So entsteht der Incident:
+
+| Feld | Wert |
+|---|---|
+| `record_type` / `subtype` / `category` | `incident` / `outage` / `monitoring` |
+| `source` / `external_id` | `monitoring` / `outage_id` |
+| `impact` × `urgency` → Priorität | `critical → 1/1 (P1)`, `high → 1/2 (P2)`, `medium → 2/2 (P3)`, `low → 3/2 (P4)`; unbekannte Severity zählt als `high` |
+| `title` | „`<name>`: nicht erreichbar seit `<since>`“ |
+| `description` | Monitor, CI, Host, Regel, Dauer, letzter Fehler |
+| `tags` | `auto`, `monitoring`, `<kind>` (Entity-Registry-Kind, z. B. `service`, `host`) |
+| `custom_fields` | `monitor_rule` (Regel als JSON), `outage_id`, `ci_kind` |
+| CI-Links | `ci_id` als `affected`, `host_ci_id` als `related` — Namen/Typen aus der Entity Registry; ohne Registry (oder wenn sie das CI noch nicht kennt) rohe UUID-Links |
+| `created_by` / `requester` | `monitoring` |
+
+**Dedupe.** (1) Je Ausfall: existiert `(monitoring, outage_id)` schon, passiert nichts — auch
+wenn eine andere Cluster-Instanz den Datensatz zwischen Prüfung und Einfügen angelegt hat
+(`UNIQUE(source, external_id)`, der Datensatz des Gewinners gilt). (2) Je CI: hat das CI bereits
+einen **offenen** Monitoring-Incident (Status mit Kind `open`: `new`, `in_progress`, `on_hold`),
+bekommt dieser eine Arbeitsnotiz „Erneuter Ausfall gemeldet …“ statt eines zweiten Datensatzes.
+`resolved` zählt dabei **nicht** als offen: ein neuer Ausfall nach dem Lösen erzeugt einen
+**neuen** Incident, es wird nichts wiedereröffnet (Entscheidung F).
+
+**Recovery.** `outage_recovered {outage_id, ci_id, since, recovered_at, duration_s}` sucht den
+Incident über `outage_id`:
+
+- Regel `auto_resolve: true` (aus `custom_fields.monitor_rule`, nicht aus dem Payload) →
+  Übergang nach `resolved` mit `resolution_code: auto_recovered` und generierten
+  `resolution_notes`; Benachrichtigung `record_state_changed` wie bei jedem Übergang.
+- `auto_resolve: false` → Kommentar „Monitor wieder erreichbar …“ (löst `record_commented` aus).
+- Übergang laut Katalog nicht erlaubt (z. B. aus `on_hold`) → Kommentar, Status bleibt.
+- Gleichzeitige Änderung (Versionskonflikt) → einmal neu lesen und wiederholen; hat inzwischen
+  jemand gelöst oder geschlossen, passiert nichts mehr; sonst Log-Eintrag.
+- Bereits `resolved`/`closed`/`cancelled` → nichts. Unbekannte `outage_id` → nichts, außer das CI
+  hat einen offenen Monitoring-Incident mit Arbeitsnotiz zu diesem Ausfall (Dedupe 2) — dann
+  wird auch das Ende dort notiert.
+
+**Benachrichtigung.** Automatisch angelegte Incidents mit P1/P2 erzeugen `record_created`
+(Severity `warning`, Payload-`link` `/apps/lyndrix-plugin-itsm/itsm?record=<uuid>`).
+
+**Texte.** Titel, Beschreibung, Notizen und Lösungstext kommen aus `locales/itsm.<locale>.json`,
+Abschnitt `auto`, in der Sprache der Einstellung `auto_text_locale` (Standard `de`, Fallback
+Englisch). Zeitstempel stehen in UTC.
+
+## Tasks aus Wartungs-Ereignissen (ab 0.3.0)
+
+Hat ein Service `deploy_policy: window`, liegt aber im Planungshorizont (Standard 30 Tage) kein
+Wartungsfenster, deployt der IaC-Orchestrator sofort (mit Warnung) und sendet
+`maintenance:window_missing {event_id, ci_id, kind, name, host_ci_id?, site, stage,
+horizon_days, job_id, source, detected_at, reason}` (Entscheidung H). Daraus entsteht ein
+**Task**, damit die Lücke in der SSoT geschlossen wird:
+
+| Feld | Wert |
+|---|---|
+| `title` | „Wartungsfenster definieren: `<name>`“ |
+| `description` | Service, Site/Stage, Horizont, Job, Zeitpunkt, Grund und die Anleitung (Fenster in `service.yml` → `maintenance.windows` oder im Controller → Host-Fenster / `stage_vars.maintenance_default`) |
+| Priorität | P4 (`impact 3`, `urgency 2`) |
+| `category` / `assignment_group` | `maintenance` / `infra` |
+| `tags` | `auto`, `maintenance`, `<kind>` |
+| `custom_fields` | `source_ref` = `event_id`, `due` = `detected_at` + 14 Tage |
+| `source` / `external_id` | `maintenance` / `event_id` (`window_missing:<ci_id>:<job_id>`) |
+| CI-Links | Service `affected`, Host `related` |
+
+Dedupe wie bei den Incidents: je Ereignis über `(maintenance, event_id)` und je CI — ein offener
+Task (`open`, `in_progress`) bekommt die Arbeitsnotiz „Erneuter Deploy ohne Wartungsfenster: Job
+… “, ein `done`/`cancelled` Task wird nicht wiedereröffnet (der nächste Deploy ohne Fenster legt
+einen neuen an). Keine Benachrichtigung; der Task erscheint in der Liste mit dem Tag `auto`
+(Filter „nur automatische“).
 
 ## Einstellungen (Plugin-Settings-Dialog, in Vault gespeichert)
 
@@ -175,6 +284,7 @@ Einstellungen).
 | `attachment_dir` | `/data/storage/itsm/attachments` | Ablageort für Anhänge |
 | `max_attachment_mb` | `25` | Größenlimit je Datei |
 | `catalog_dir` | leer (= mitgelieferter Katalog) | eigenes Verzeichnis mit `record_types/*.yml` — **ersetzt** den mitgelieferten Satz |
+| `auto_text_locale` | `de` | Sprache (`de`/`en`) der Texte, die das Plugin selbst schreibt (Incidents aus dem Monitoring, Tasks aus Wartungs-Ereignissen) |
 
 Die Einstellungen werden nach `vault:ready_for_data` und bei jedem `plugin:settings_changed`
 (Core ≥ 1.5.1, wird an alle Instanzen verteilt) angewendet — Speichern im Settings-Dialog wirkt
@@ -224,7 +334,9 @@ Route `/itsm` (im Shell `/apps/lyndrix-plugin-itsm/itsm`). Deep-Links: `?record=
 *betroffen* vorbelegt (so verlinken Server Manager und Entity Registry „Incident melden“),
 `?ci=<uuid>` listet alle Datensätze zu einem CI.
 
-- **Liste**: Suche, Filter Typ/Status/Priorität, „geschlossene einblenden“, CI-Filter-Chip.
+- **Liste**: Suche, Filter Typ/Status/Priorität, „geschlossene einblenden“, „nur automatische“
+  (Tag `auto`: vom Plugin angelegte Incidents und Tasks), CI-Filter-Chip; Tags als Chips, `auto`
+  hervorgehoben (auch im Detailkopf).
 - **Neu**: Formular wird aus dem Katalog erzeugt (Untertyp, Kategoriebaum, Impact/Urgency mit
   Prioritätsvorschau, Gruppe, Custom Fields, CI-Picker).
 - **CI-Picker** (Neu und Detail): Name oder Identifier tippen (z. B. `docker-hydra`) oder eine
@@ -253,9 +365,16 @@ npm install && npm run build          # React-Bundle
 ruff check entrypoint.py app tests
 
 docker cp . lyndrix-core-dev:/tmp/itsm
-docker exec -w /tmp/itsm -e PYTHONPATH=/app:/tmp/pytest-sm lyndrix-core-dev python -m pytest -q tests
+docker exec -w /tmp/itsm -e PYTHONPATH=/app:/tmp/pytest-sm:/tmp/itsm \
+  -e LYNDRIX_CLUSTER_MODE=single -e LYNDRIX_COORDINATOR=local \
+  lyndrix-core-dev python -m pytest -q tests
 ```
 
-Die Service-Tests (SQLite im Speicher) decken Nummernvergabe, Prioritätsmatrix, Katalogvalidierung,
-unerlaubte Übergänge, Pflichtfelder, Wiedereröffnen, optimistisches Sperren, Journal,
-Verknüpfungen in beide Richtungen, Anhänge mit Limits und den Ingest-Schlüssel ab.
+Die Service-Tests (SQLite im Speicher, Fixture `svc` in `tests/conftest.py`, Doubles in
+`tests/fakes.py`) decken Nummernvergabe, Prioritätsmatrix, Katalogvalidierung, unerlaubte
+Übergänge, Pflichtfelder, Wiedereröffnen, optimistisches Sperren, Journal, Verknüpfungen in beide
+Richtungen, Anhänge mit Limits und den Ingest-Schlüssel ab. `test_monitoring_incidents.py` und
+`test_maintenance_tasks.py` spielen die Bus-Ereignisse des Wartungsfenster-Vertrags gegen den
+echten Service durch (Prioritätsmapping, beide Dedupe-Stufen, Auto-Resolve inkl. `on_hold`- und
+Versionskonflikt-Fällen, Registry nicht erreichbar, verlorenes Einfüge-Rennen, neuer Incident
+nach `resolved`, Task-Anlage/-Notiz/-Neuanlage).

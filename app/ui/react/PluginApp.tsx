@@ -79,6 +79,27 @@ function PriorityBadge({ record, catalog }: { record: RecordSummary; catalog: Ca
   return <span className={`lx-badge ${mod}`} title={lvl?.label}>{record.priority}</span>
 }
 
+/** Tags as chips. `auto` marks records the plugin opened itself (monitoring
+ *  outage → incident, missing maintenance window → task) and stands out. */
+function TagChips({ tags, size = 'sm' }: { tags: string[]; size?: 'sm' | 'md' }) {
+  const { t } = useTranslation('itsm')
+  if (tags.length === 0) return null
+  const font = size === 'sm' ? '0.62rem' : undefined
+  return (
+    <span style={{ display: 'inline-flex', flexWrap: 'wrap', gap: '0.25rem', alignItems: 'center' }}>
+      {tags.map((tag) => tag === 'auto' ? (
+        <span key={tag} className="lx-badge lx-badge--accent" style={{ fontSize: font }}
+          title={t('tag.autoHint', { defaultValue: 'Opened by the plugin itself — from a monitoring outage or a maintenance event' })}>
+          <span className="material-icons" style={{ fontSize: size === 'sm' ? 11 : 13 }}>bolt</span>
+          {t('tag.auto', { defaultValue: 'automatic' })}
+        </span>
+      ) : (
+        <span key={tag} className="lx-badge lx-badge--muted" style={{ fontSize: font }}>{tag}</span>
+      ))}
+    </span>
+  )
+}
+
 function flattenCategories(rt: RecordTypeDef | null): { id: string; label: string }[] {
   const out: { id: string; label: string }[] = []
   const walk = (cats: RecordTypeDef['categories'], depth: number) => {
@@ -281,6 +302,8 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
   const [state, setState] = useState('')
   const [priority, setPriority] = useState('')
   const [includeClosed, setIncludeClosed] = useState(false)
+  // Only records the plugin opened itself (tag "auto": monitoring incidents, maintenance tasks).
+  const [autoOnly, setAutoOnly] = useState(false)
   // Optional CI filter (deep link /itsm?ci=<uuid>, or "records for this CI").
   const [ci, setCi] = useState(initialCi ?? '')
   const [ciName, setCiName] = useState<string | null>(null)
@@ -296,7 +319,7 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
     setLoading(true)
     setError(null)
     try {
-      const res = await itsmApi.list({ q: q.trim() || undefined, type: type || undefined, state: state || undefined, priority: priority || undefined, ci: ci || undefined, include_closed: includeClosed, limit: 500 })
+      const res = await itsmApi.list({ q: q.trim() || undefined, type: type || undefined, state: state || undefined, priority: priority || undefined, ci: ci || undefined, tag: autoOnly ? 'auto' : undefined, include_closed: includeClosed, limit: 500 })
       setRecords(res.records)
       setTotal(res.total)
     } catch (err) {
@@ -304,7 +327,7 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
     } finally {
       setLoading(false)
     }
-  }, [q, type, state, priority, ci, includeClosed])
+  }, [q, type, state, priority, ci, autoOnly, includeClosed])
 
   useEffect(() => {
     const h = window.setTimeout(() => void load(), q ? 250 : 0)
@@ -330,6 +353,12 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
         <label style={{ display: 'inline-flex', gap: '0.35rem', alignItems: 'center', fontSize: '0.8rem', color: 'var(--lx-text-muted)' }}>
           <input type="checkbox" checked={includeClosed} onChange={(e) => setIncludeClosed(e.target.checked)} />
           {t('list.includeClosed', { defaultValue: 'include closed' })}
+        </label>
+        <label style={{ display: 'inline-flex', gap: '0.35rem', alignItems: 'center', fontSize: '0.8rem', color: 'var(--lx-text-muted)' }}
+          title={t('tag.autoHint', { defaultValue: 'Opened by the plugin itself — from a monitoring outage or a maintenance event' })}>
+          <input type="checkbox" checked={autoOnly} onChange={(e) => setAutoOnly(e.target.checked)} />
+          <span className="material-icons" style={{ fontSize: 14 }}>bolt</span>
+          {t('list.autoOnly', { defaultValue: 'automatic only' })}
         </label>
         {ci && (
           <span className="lx-badge lx-badge--accent" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.3rem' }}>
@@ -365,7 +394,7 @@ function RecordList({ catalog, onOpen, initialCi }: { catalog: Catalog | null; o
                   <td className="lx-mono" style={{ fontSize: '0.78rem', whiteSpace: 'nowrap' }}>{r.number}</td>
                   <td>
                     <div style={{ fontWeight: 600, color: 'var(--lx-text)' }}>{r.title}</div>
-                    {r.tags.length > 0 && <div style={{ fontSize: '0.68rem', color: 'var(--lx-text-muted)' }}>{r.tags.join(', ')}</div>}
+                    {r.tags.length > 0 && <div style={{ marginTop: '0.2rem' }}><TagChips tags={r.tags} /></div>}
                   </td>
                   <td><TypeBadge type={r.record_type} catalog={catalog} /></td>
                   <td><StateBadge record={r} catalog={catalog} /></td>
@@ -731,6 +760,7 @@ function RecordDetailView({ recordRef, catalog, onBack, onOpen, onChanged, onFil
             <TypeBadge type={record.record_type} catalog={catalog} />
             <StateBadge record={record} catalog={catalog} />
             <PriorityBadge record={record} catalog={catalog} />
+            {record.tags.includes('auto') && <TagChips tags={['auto']} size="md" />}
             {record.sync_state && <span className="lx-badge lx-badge--paused">{record.sync_state}</span>}
             <span style={{ flex: 1 }} />
             {record.allowed_transitions.map((s) => (
@@ -760,7 +790,7 @@ function RecordDetailView({ recordRef, catalog, onBack, onOpen, onChanged, onFil
                     <span className="lx-label">{t('field.assignment_group', { defaultValue: 'Group' })}</span><span>{rt.assignment_groups.find((g) => g.id === record.assignment_group)?.label ?? record.assignment_group ?? '—'}</span>
                     <span className="lx-label">{t('field.assignee', { defaultValue: 'Assignee' })}</span><span>{record.assignee ?? '—'}</span>
                     <span className="lx-label">{t('field.requester', { defaultValue: 'Requester' })}</span><span>{record.requester ?? '—'}</span>
-                    <span className="lx-label">{t('field.tags', { defaultValue: 'Tags' })}</span><span>{record.tags.join(', ') || '—'}</span>
+                    <span className="lx-label">{t('field.tags', { defaultValue: 'Tags' })}</span><span>{record.tags.length > 0 ? <TagChips tags={record.tags} /> : '—'}</span>
                     <span className="lx-label">{t('field.opened', { defaultValue: 'Opened' })}</span><span>{fmt(record.opened_at)}</span>
                     <span className="lx-label">{t('field.resolved', { defaultValue: 'Resolved' })}</span><span>{fmt(record.resolved_at)}</span>
                     <span className="lx-label">{t('field.closed', { defaultValue: 'Closed' })}</span><span>{fmt(record.closed_at)}</span>
