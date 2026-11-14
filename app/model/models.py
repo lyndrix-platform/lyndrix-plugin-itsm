@@ -199,12 +199,19 @@ class RecordLink(_Base):
     __tablename__ = "itsm_record_links"
     __table_args__ = (
         UniqueConstraint("from_uuid", "to_uuid", "relation", name="uq_itsm_record_link"),
+        # A→B "parent_of" and B→A "child_of" are the same link: pair_key is its
+        # direction-independent form, so the DB rejects the inverse duplicate
+        # two instances would otherwise both insert.
+        Index("uq_itsm_record_link_pair", "pair_key", unique=True),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     from_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), nullable=False, index=True)
     to_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), nullable=False, index=True)
     relation = Column(String(32), nullable=False)
+    # NULL only on rows of an instance older than 0.3.1 until the next boot
+    # backfills them (NULLs never collide in a unique index).
+    pair_key = Column(String(128), nullable=True)
     created_at = Column(DateTime, nullable=False, default=func.now())
 
     def to_dict(self) -> dict:
@@ -215,6 +222,15 @@ class RecordLink(_Base):
             "relation": self.relation,
             "created_at": _iso(self.created_at),
         }
+
+
+def record_link_pair_key(from_uuid: str, to_uuid: str, relation: str, inverse: str) -> str:
+    """Direction-independent identity of a record link: the pair ordered by
+    uuid plus the relation as seen from the lower uuid (``inverse`` is the
+    relation as seen from ``to_uuid``)."""
+    if from_uuid <= to_uuid:
+        return f"{from_uuid}:{to_uuid}:{relation}"
+    return f"{to_uuid}:{from_uuid}:{inverse}"
 
 
 class Attachment(_Base):

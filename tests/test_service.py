@@ -814,3 +814,103 @@ def test_tag_mirror_follows_updates_and_backfills_old_rows(svc):
     assert svc.list_records(tag="b")["total"] == 1
     names = {ix["name"] for ix in __import__("sqlalchemy").inspect(database.db_instance.engine).get_indexes("itsm_records")}
     assert "ix_itsm_records_closed_opened" in names
+
+
+# ── IT-04: link races ──────────────────────────────────────────────────────────
+
+def _raw_link(a: str, b: str, relation: str, pair_key=None) -> None:
+    from sqlalchemy import text
+
+    from app.model import database
+
+    with database.db_instance.engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO itsm_record_links (from_uuid, to_uuid, relation, pair_key, created_at) "
+            "VALUES (:a, :b, :r, :k, CURRENT_TIMESTAMP)"), {"a": a, "b": b, "r": relation, "k": pair_key})
+
+
+def test_inverse_record_link_is_rejected_by_the_db_and_counts_as_linked(svc, monkeypatch):
+    """Two instances link A→B parent_of and B→A child_of at the same time."""
+    from sqlalchemy.exc import IntegrityError
+
+    from app.model.models import record_link_pair_key
+
+    a, b = _inc(svc), _inc(svc, title="child")
+    svc.link_records(a["uuid"], b["uuid"], "parent_of", author="m")
+    with pytest.raises(IntegrityError):  # the pair key closes the gap of (from, to, relation)
+        _raw_link(b["uuid"], a["uuid"], "child_of",
+                  record_link_pair_key(b["uuid"], a["uuid"], "child_of", "parent_of"))
+
+    # The loser's existence check saw nothing; its insert hits the unique key.
+    svc.unlink_records(a["uuid"], b["uuid"], "parent_of")
+    real_filter = svc._record_link_filter
+    state = {"first": True}
+
+    def _peer_inserts_after_check(*args):
+        if state.pop("first", False):
+            _raw_link(a["uuid"], b["uuid"], "parent_of",
+                      record_link_pair_key(a["uuid"], b["uuid"], "parent_of", "child_of"))
+            from sqlalchemy import false
+            return false()
+        return real_filter(*args)
+
+    monkeypatch.setattr(svc, "_record_link_filter", _peer_inserts_after_check)
+    detail = svc.link_records(b["uuid"], a["uuid"], "child_of", author="m")  # no 500
+    assert [lk["relation_from_here"] for lk in detail["links"]] == ["child_of"]
+
+
+def test_legacy_inverse_duplicates_are_removable_and_deduped_on_boot(svc):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    a, b = _inc(svc), _inc(svc, title="child")
+    # Rows as an instance before the pair key could leave them behind.
+    _raw_link(a["uuid"], b["uuid"], "parent_of")
+    _raw_link(b["uuid"], a["uuid"], "child_of")
+    assert len(svc.unlink_records(a["uuid"], b["uuid"], "parent_of")["links"]) == 0  # was a 500
+
+    _raw_link(a["uuid"], b["uuid"], "parent_of")
+    _raw_link(b["uuid"], a["uuid"], "child_of")
+    database.ensure_tables()
+    database.ensure_tables()
+    with database.db_instance.engine.begin() as conn:
+        rows = conn.execute(text("SELECT from_uuid, pair_key FROM itsm_record_links")).all()
+    assert len(rows) == 1 and rows[0][0] == a["uuid"] and rows[0][1]  # oldest kept, keyed
+    assert len(svc.get_record(a["uuid"])["links"]) == 1
+
+
+def test_concurrent_ci_link_is_idempotent(svc, monkeypatch):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    rec = _inc(svc)
+    ci = "99999999-9999-9999-9999-999999999999"
+    real = svc._check_ci_links
+
+    def _peer_links_first(links):
+        with database.db_instance.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO itsm_ci_links (record_uuid, entity_uuid, role, created_at) "
+                "VALUES (:r, :c, 'affected', CURRENT_TIMESTAMP)"), {"r": rec["uuid"], "c": ci})
+        return real(links)
+
+    monkeypatch.setattr(svc, "_check_ci_links", _peer_links_first)
+    # Hide the peer's row from the existence check, as a concurrent transaction would.
+    from app.logic import service as service_mod
+    real_select = service_mod.select
+    detail = None
+
+    def _select(*entities):
+        stmt = real_select(*entities)
+        if entities and entities[0] is service_mod.CiLink and detail is None:
+            return stmt.where(service_mod.CiLink.id < 0)
+        return stmt
+
+    monkeypatch.setattr(service_mod, "select", _select)
+    try:
+        svc.link_ci(rec["uuid"], ci, "affected", author="m")  # no IntegrityError → no 500
+    finally:
+        monkeypatch.setattr(service_mod, "select", real_select)
+    assert [c["entity_uuid"] for c in svc.get_record(rec["uuid"])["ci_links"]] == [ci]

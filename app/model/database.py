@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 
 from core.api import db_instance, get_logger
 
-from .models import Record, RecordTag, _Base, tag_key
+from .models import Record, RecordLink, RecordTag, _Base, record_link_pair_key, tag_key
 
 log = get_logger("Plugin:ITSM:DB")
 
@@ -34,12 +34,16 @@ _EXISTS_TEXT = ("already exists", "duplicate column")
 # Columns added after a table's first release, keyed by table — create_all()
 # never alters existing tables, so this is the hand-rolled migration path:
 # {"itsm_records": {"new_col": "VARCHAR(64)"}}.
-_NEW_COLUMNS: dict[str, dict[str, str]] = {}
+_NEW_COLUMNS: dict[str, dict[str, str]] = {
+    "itsm_record_links": {"pair_key": "VARCHAR(128)"},
+}
 
 # Indexes added after a table's first release (create_all() never adds them to
-# an existing table): {"table": {"index_name": "col_a, col_b"}}.
+# an existing table): {"table": {"index_name": "col_a, col_b"}}; a name
+# starting with "uq_" is created UNIQUE.
 _NEW_INDEXES: dict[str, dict[str, str]] = {
     "itsm_records": {"ix_itsm_records_closed_opened": "closed_at, opened_at"},
+    "itsm_record_links": {"uq_itsm_record_link_pair": "pair_key"},
 }
 _BACKFILL_CHUNK = 500
 
@@ -109,6 +113,7 @@ def ensure_tables() -> None:
             log.info("DB: a peer created ITSM tables concurrently — re-checking")
             _Base.metadata.create_all(db_instance.engine, checkfirst=True)
         _migrate_columns()
+        _backfill_record_link_keys()  # dedupes first — the unique index comes after
         _migrate_indexes()
         _backfill_record_tags()
     log.info("DB: itsm tables ready")
@@ -146,11 +151,48 @@ def _migrate_indexes() -> None:
                 continue
             try:
                 with engine.begin() as conn:
-                    conn.execute(text(f"CREATE INDEX {name} ON {table} ({columns})"))
+                    unique = "UNIQUE " if name.startswith("uq_") else ""
+                    conn.execute(text(f"CREATE {unique}INDEX {name} ON {table} ({columns})"))
                 log.info(f"DB: migrated — added index '{name}' to {table}")
             except Exception as exc:
                 if not is_already_exists(exc):
                     raise
+
+
+def _backfill_record_link_keys() -> None:
+    """Give record links written before 0.3.1 their ``pair_key`` and remove
+    inverse duplicates (A→B parent_of next to B→A child_of — two instances
+    could insert both), keeping the oldest row of each pair. Runs under the
+    bootstrap lock before the unique index is created; idempotent."""
+    # Imported here: the catalog module is pure data, but keep model → logic
+    # imports out of module import time.
+    from ..logic.catalog import RECORD_LINK_RELATIONS
+
+    engine = db_instance.engine
+    links = RecordLink.__table__
+    removed = keyed = 0
+    while True:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                select(links.c.id, links.c.from_uuid, links.c.to_uuid, links.c.relation)
+                .where(links.c.pair_key.is_(None)).order_by(links.c.id).limit(_BACKFILL_CHUNK)
+            ).all()
+            if not rows:
+                break
+            for link_id, from_uuid, to_uuid, relation in rows:
+                key = record_link_pair_key(from_uuid, to_uuid, relation,
+                                           RECORD_LINK_RELATIONS.get(relation, relation))
+                taken = conn.execute(
+                    select(links.c.id).where(links.c.pair_key == key).limit(1)
+                ).first()
+                if taken is not None:
+                    conn.execute(links.delete().where(links.c.id == link_id))
+                    removed += 1
+                else:
+                    conn.execute(links.update().where(links.c.id == link_id).values(pair_key=key))
+                    keyed += 1
+    if removed or keyed:
+        log.info(f"DB: record links — {keyed} keyed, {removed} inverse duplicate(s) removed")
 
 
 def _backfill_record_tags() -> None:

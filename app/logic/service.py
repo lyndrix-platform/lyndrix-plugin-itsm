@@ -51,6 +51,7 @@ from ..model.models import (
     Record,
     RecordLink,
     RecordTag,
+    record_link_pair_key,
     tag_key,
 )
 from . import attachments as att
@@ -923,7 +924,16 @@ class ItsmService:
             s.add(CiLink(record_uuid=rec.uuid, **link))
             self._journal(s, rec.uuid, "link", author, None,
                           {"ci": entity_uuid, "role": link["role"], "display_name": display_name, "action": "added"})
-            s.commit()
+            try:
+                s.commit()
+            except IntegrityError:
+                # uq_itsm_ci_link: another request linked the same CI between
+                # our check and the insert — the link exists, which is what
+                # the caller asked for.
+                s.rollback()
+                rec = self._get(s, ref)
+                if rec is None:
+                    raise NotFound(f"Unknown record: {ref}") from None
             return self._detail(s, rec)
 
     def unlink_ci(self, ref: str, entity_uuid: str, role: str, *, author: str | None = None) -> dict:
@@ -942,6 +952,14 @@ class ItsmService:
             s.commit()
             return self._detail(s, rec)
 
+    @staticmethod
+    def _record_link_filter(a_uuid: str, b_uuid: str, relation: str, inverse: str):
+        """The link a→b ``relation`` in either stored direction."""
+        return or_(
+            (RecordLink.from_uuid == a_uuid) & (RecordLink.to_uuid == b_uuid) & (RecordLink.relation == relation),
+            (RecordLink.from_uuid == b_uuid) & (RecordLink.to_uuid == a_uuid) & (RecordLink.relation == inverse),
+        )
+
     def link_records(self, from_ref: str, to_ref: str, relation: str, *, author: str | None = None) -> dict:
         self._require_ready()
         if relation not in RECORD_LINK_RELATIONS:
@@ -954,15 +972,23 @@ class ItsmService:
                 raise ItsmError("A record cannot link to itself")
             # Store one row for the pair: if the inverse already exists, that's the same link.
             inverse = RECORD_LINK_RELATIONS[relation]
-            existing = s.execute(select(RecordLink).where(or_(
-                (RecordLink.from_uuid == a.uuid) & (RecordLink.to_uuid == b.uuid) & (RecordLink.relation == relation),
-                (RecordLink.from_uuid == b.uuid) & (RecordLink.to_uuid == a.uuid) & (RecordLink.relation == inverse),
-            ))).scalar_one_or_none()
+            existing = s.execute(
+                select(RecordLink.id).where(self._record_link_filter(a.uuid, b.uuid, relation, inverse)).limit(1)
+            ).first()
             if existing is None:
-                s.add(RecordLink(from_uuid=a.uuid, to_uuid=b.uuid, relation=relation))
+                s.add(RecordLink(from_uuid=a.uuid, to_uuid=b.uuid, relation=relation,
+                                 pair_key=record_link_pair_key(a.uuid, b.uuid, relation, inverse)))
                 self._journal(s, a.uuid, "link", author, None, {"record": b.number, "relation": relation, "action": "added"})
                 self._journal(s, b.uuid, "link", author, None, {"record": a.number, "relation": inverse, "action": "added"})
-                s.commit()
+                try:
+                    s.commit()
+                except IntegrityError:
+                    # Lost the race against the same link (or its inverse, see
+                    # uq_itsm_record_link_pair) from another request: linked is linked.
+                    s.rollback()
+                    a = self._get(s, from_ref)
+                    if a is None:
+                        raise NotFound("Unknown record") from None
             return self._detail(s, a)
 
     def unlink_records(self, from_ref: str, to_ref: str, relation: str, *, author: str | None = None) -> dict:
@@ -972,13 +998,15 @@ class ItsmService:
             a, b = self._get(s, from_ref), self._get(s, to_ref)
             if a is None or b is None:
                 raise NotFound("Unknown record")
-            link = s.execute(select(RecordLink).where(or_(
-                (RecordLink.from_uuid == a.uuid) & (RecordLink.to_uuid == b.uuid) & (RecordLink.relation == relation),
-                (RecordLink.from_uuid == b.uuid) & (RecordLink.to_uuid == a.uuid) & (RecordLink.relation == inverse),
-            ))).scalar_one_or_none()
-            if link is None:
+            # All matching rows: a pair duplicated before the unique pair key
+            # existed must still be removable in one call.
+            links = s.execute(
+                select(RecordLink).where(self._record_link_filter(a.uuid, b.uuid, relation, inverse))
+            ).scalars().all()
+            if not links:
                 raise NotFound("Unknown record link")
-            s.delete(link)
+            for link in links:
+                s.delete(link)
             self._journal(s, a.uuid, "link", author, None, {"record": b.number, "relation": relation, "action": "removed"})
             self._journal(s, b.uuid, "link", author, None, {"record": a.number, "relation": inverse, "action": "removed"})
             s.commit()
