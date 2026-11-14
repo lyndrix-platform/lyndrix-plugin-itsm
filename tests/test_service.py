@@ -914,3 +914,30 @@ def test_concurrent_ci_link_is_idempotent(svc, monkeypatch):
     finally:
         monkeypatch.setattr(service_mod, "select", real_select)
     assert [c["entity_uuid"] for c in svc.get_record(rec["uuid"])["ci_links"]] == [ci]
+
+
+# ── IT-05: fields changed by a transition are audited ──────────────────────────
+
+def test_transition_journals_old_and_new_values_and_announces_the_change(svc):
+    rec = _inc(svc, description="original text")
+    svc._ctx.events.clear()
+    out = svc.transition(rec["uuid"], "in_progress", author="m",
+                         fields={"assignee": "anna", "description": "rewritten"})
+    change = [j for j in out["journal"] if j["kind"] == "field_change"]
+    assert len(change) == 1 and change[0]["author"] == "m"
+    assert change[0]["data"]["changes"] == {
+        "assignee": {"old": None, "new": "anna"},
+        "description": {"old": "original text", "new": "rewritten"},
+    }
+    assert [j["kind"] for j in out["journal"]][-2:] == ["field_change", "state_change"]
+    assert svc._ctx.topics() == ["itsm:record_updated", "itsm:state_changed"]
+    updated = svc._ctx.payloads("itsm:record_updated")[0]
+    assert updated["changes"]["assignee"] == {"old": None, "new": "anna"}  # → record_assigned notification
+    assert updated["record"]["state"] == "in_progress"
+
+    # Same values again / no fields: nothing to journal, no update event.
+    svc._ctx.events.clear()
+    out = svc.transition(rec["uuid"], "resolved", author="m",
+                         fields={"assignee": "anna", "resolution_code": "fixed", "resolution_notes": "done"})
+    last_change = [j for j in out["journal"] if j["kind"] == "field_change"][-1]
+    assert set(last_change["data"]["changes"]) == {"custom_fields.resolution_code", "custom_fields.resolution_notes"}

@@ -728,15 +728,19 @@ class ItsmService:
                    expected_version: int | None = None) -> dict:
         self._require_ready()
         fields = dict(fields or {})
-        detail, from_state = self._versioned_write(
+        detail, from_state, diff = self._versioned_write(
             lambda: self._transition_tx(ref, to_state, fields, author, note, expected_version),
             expected_version=expected_version,
         )
         log.info(f"ITSM: {detail['number']} {from_state} → {to_state} by {author}")
+        if diff:
+            # Fields set along with the transition are ordinary field changes:
+            # same event as a PATCH, so e.g. the assignment notification fires.
+            self._emit("itsm:record_updated", {"record": detail, "changes": diff})
         self._emit("itsm:state_changed", {"record": detail, "from_state": from_state, "to_state": to_state})
         return detail
 
-    def _transition_tx(self, ref, to_state, fields, author, note, expected_version) -> tuple[dict, str]:
+    def _transition_tx(self, ref, to_state, fields, author, note, expected_version) -> tuple[dict, str, dict]:
         with get_session() as s:
             rec = self._get(s, ref)
             if rec is None:
@@ -760,12 +764,23 @@ class ItsmService:
             core_fields = {k: v for k, v in fields.items() if k in ("assignee", "assignment_group", "category", "subtype", "description")}
             custom_in = {k: v for k, v in fields.items() if k not in core_fields}
             applied = self._validate_classification(rt, core_fields, partial=True)
+            # Old/new of everything the transition overwrites — journalled below
+            # in the same transaction, like a PATCH (an overwritten description
+            # must not vanish from the audit trail).
+            diff: dict[str, dict] = {}
             for k, v in applied.items():
-                setattr(rec, k, v)
+                old = getattr(rec, k)
+                if old != v:
+                    diff[k] = {"old": old, "new": v}
+                    setattr(rec, k, v)
             try:
                 custom = rt.validate_custom_fields(custom_in)
             except CatalogError as exc:
                 raise ItsmError(str(exc)) from exc
+            for k, v in custom.items():
+                old = (rec.custom_fields or {}).get(k)
+                if old != v:
+                    diff[f"custom_fields.{k}"] = {"old": old, "new": v}
             rec.custom_fields = {**(rec.custom_fields or {}), **custom}
 
             missing = []
@@ -789,12 +804,14 @@ class ItsmService:
             else:
                 rec.resolved_at = None
                 rec.closed_at = None
+            if diff:
+                self._journal(s, rec.uuid, "field_change", author, None, {"changes": diff})
             self._journal(s, rec.uuid, "state_change", author, note,
                           {"from": from_state, "to": to_state, "fields": sorted(fields)})
             self._bump_version(s, rec, base_version)
             s.commit()
             s.refresh(rec)
-            return self._detail(s, rec), from_state
+            return self._detail(s, rec), from_state, diff
 
     # ── Journal ──────────────────────────────────────────────────────────────
 
