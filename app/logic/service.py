@@ -466,12 +466,20 @@ class ItsmService:
             raise ItsmError("source and external_id must be given together")
 
         def _tx() -> dict:
+            # Three short sessions one after the other — never two pooled
+            # connections at once: a burst of creates (hypervisor down → N
+            # outage incidents) must not need 2×N connections of the shared pool.
+            if source:
+                with get_session() as s:
+                    if s.execute(
+                        select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
+                    ).scalar_one_or_none():
+                        raise DuplicateRecord(f"Record {source}/{external_id} already exists")
+            # Own committed counter transaction; a number whose insert fails
+            # below is skipped (numbers are unique, not gap-free). A duplicate
+            # slipping in after the check above is caught by uq_itsm_source_ext.
+            number = self._allocate_number(rt)
             with get_session() as s:
-                if source and s.execute(
-                    select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
-                ).scalar_one_or_none():
-                    raise DuplicateRecord(f"Record {source}/{external_id} already exists")
-                number = self._allocate_number(rt)
                 rec = Record(
                     uuid=str(uuid4()), number=number, record_type=rt.id,
                     subtype=fields.get("subtype"), category=fields.get("category"),

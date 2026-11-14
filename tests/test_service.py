@@ -941,3 +941,34 @@ def test_transition_journals_old_and_new_values_and_announces_the_change(svc):
                          fields={"assignee": "anna", "resolution_code": "fixed", "resolution_notes": "done"})
     last_change = [j for j in out["journal"] if j["kind"] == "field_change"][-1]
     assert set(last_change["data"]["changes"]) == {"custom_fields.resolution_code", "custom_fields.resolution_notes"}
+
+
+# ── IT-06: one DB connection per create ────────────────────────────────────────
+
+def test_create_never_holds_two_sessions_at_once(svc, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.logic import service as service_mod
+
+    real = service_mod.get_session
+    depth = {"now": 0, "max": 0}
+
+    @contextmanager
+    def _counting():
+        with real() as s:
+            depth["now"] += 1
+            depth["max"] = max(depth["max"], depth["now"])
+            try:
+                yield s
+            finally:
+                depth["now"] -= 1
+
+    monkeypatch.setattr(service_mod, "get_session", _counting)
+    rec = svc.create_record({"record_type": "incident", "title": "pushed", "source": "gw",
+                             "external_id": "X-1"}, author="m")
+    assert rec["number"] == "INC0000001" and depth["max"] == 1
+    with pytest.raises(service_mod.DuplicateRecord):
+        svc.create_record({"record_type": "incident", "title": "again", "source": "gw",
+                           "external_id": "X-1"}, author="m")
+    assert _inc(svc)["number"] == "INC0000002"  # the rejected duplicate consumed no number
+    assert depth["max"] == 1
