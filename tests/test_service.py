@@ -744,3 +744,73 @@ def test_health_report_is_one_cheap_count(svc):
     status, details = svc.health_report()
     assert status == "ok" and details["open"] == 1
     assert "open_by_type" not in details
+
+
+# ── IT-02: list in SQL ─────────────────────────────────────────────────────────
+
+def _statements(svc, fn):
+    """Run ``fn`` and return the SQL statements it executed."""
+    from sqlalchemy import event
+
+    from app.model import database
+
+    seen: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        seen.append(statement)
+
+    engine = database.db_instance.engine
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        result = fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+    return result, seen
+
+
+def test_list_records_pages_and_counts_in_sql(svc):
+    for i in range(7):
+        _inc(svc, title=f"rec {i}", tags=["prod"] if i % 2 else ["lab", "prod-eu"])
+    page, seen = _statements(svc, lambda: svc.list_records(limit=2, offset=2))
+    assert page["total"] == 7 and len(page["records"]) == 2
+    assert [r["title"] for r in page["records"]] == ["rec 4", "rec 3"]  # newest first
+    selects = [q for q in seen if "FROM itsm_records" in q]
+    assert len(selects) == 2  # one count, one page — never the whole table
+    assert any("count(" in q.lower() for q in selects)
+    assert any("LIMIT" in q and "OFFSET" in q for q in selects)
+
+    tagged, seen = _statements(svc, lambda: svc.list_records(tag="prod", limit=1))
+    assert tagged["total"] == 3 and len(tagged["records"]) == 1  # exact tag, not a substring
+    assert all("itsm_record_tags" in q for q in seen if "FROM itsm_records" in q)
+    assert svc.list_records(tag="pro")["total"] == 0
+
+
+def test_list_records_limit_is_clamped(svc, monkeypatch):
+    from app.logic import service as service_mod
+
+    monkeypatch.setattr(service_mod, "MAX_PAGE_SIZE", 3)
+    for i in range(5):
+        _inc(svc, title=f"rec {i}")
+    page = svc.list_records(limit=10_000)
+    assert page["total"] == 5 and len(page["records"]) == 3
+
+
+def test_tag_mirror_follows_updates_and_backfills_old_rows(svc):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    rec = _inc(svc, tags=["a", "b"])
+    svc.update_record(rec["uuid"], {"tags": ["b", "c"]}, author="m")
+    assert svc.list_records(tag="a")["total"] == 0
+    assert svc.list_records(tag="c")["total"] == 1
+
+    # Rows written before the mirror table existed (or by an older instance).
+    with database.db_instance.engine.begin() as conn:
+        conn.execute(text("DELETE FROM itsm_record_tags"))
+    assert svc.list_records(tag="b")["total"] == 0
+    database.ensure_tables()
+    database.ensure_tables()  # idempotent
+    assert svc.list_records(tag="b")["total"] == 1
+    names = {ix["name"] for ix in __import__("sqlalchemy").inspect(database.db_instance.engine).get_indexes("itsm_records")}
+    assert "ix_itsm_records_closed_opened" in names

@@ -15,12 +15,12 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import Callable, Generator, TypeVar
 
-from sqlalchemy import inspect, text
+from sqlalchemy import String, cast, func, inspect, select, text
 from sqlalchemy.orm import Session
 
 from core.api import db_instance, get_logger
 
-from .models import _Base
+from .models import Record, RecordTag, _Base, tag_key
 
 log = get_logger("Plugin:ITSM:DB")
 
@@ -35,6 +35,13 @@ _EXISTS_TEXT = ("already exists", "duplicate column")
 # never alters existing tables, so this is the hand-rolled migration path:
 # {"itsm_records": {"new_col": "VARCHAR(64)"}}.
 _NEW_COLUMNS: dict[str, dict[str, str]] = {}
+
+# Indexes added after a table's first release (create_all() never adds them to
+# an existing table): {"table": {"index_name": "col_a, col_b"}}.
+_NEW_INDEXES: dict[str, dict[str, str]] = {
+    "itsm_records": {"ix_itsm_records_closed_opened": "closed_at, opened_at"},
+}
+_BACKFILL_CHUNK = 500
 
 
 # ── Error classification ──────────────────────────────────────────────────────
@@ -102,6 +109,8 @@ def ensure_tables() -> None:
             log.info("DB: a peer created ITSM tables concurrently — re-checking")
             _Base.metadata.create_all(db_instance.engine, checkfirst=True)
         _migrate_columns()
+        _migrate_indexes()
+        _backfill_record_tags()
     log.info("DB: itsm tables ready")
 
 
@@ -125,6 +134,66 @@ def _migrate_columns() -> None:
             except Exception as exc:
                 if not is_already_exists(exc):
                     raise
+
+
+def _migrate_indexes() -> None:
+    engine = db_instance.engine
+    insp = inspect(engine)
+    for table, new_indexes in _NEW_INDEXES.items():
+        existing = {ix["name"] for ix in insp.get_indexes(table)}
+        for name, columns in new_indexes.items():
+            if name in existing:
+                continue
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f"CREATE INDEX {name} ON {table} ({columns})"))
+                log.info(f"DB: migrated — added index '{name}' to {table}")
+            except Exception as exc:
+                if not is_already_exists(exc):
+                    raise
+
+
+def _backfill_record_tags() -> None:
+    """Mirror ``Record.tags`` of rows written before 0.3.1 (or by an older
+    instance during a rolling upgrade) into ``itsm_record_tags``.
+
+    Only records without any mirror row are read, in committed chunks that
+    stay far below the statement cap; idempotent, so every boot may run it.
+    """
+    engine = db_instance.engine
+    mirrored = select(RecordTag.record_uuid)
+    last = ""
+    total = 0
+    while True:
+        with engine.begin() as conn:
+            rows = conn.execute(
+                select(Record.uuid, Record.tags)
+                # "[]" is 2 chars: untagged records are skipped by the server
+                .where(Record.uuid > last, func.length(cast(Record.tags, String)) > 2,
+                       Record.uuid.not_in(mirrored))
+                .order_by(Record.uuid).limit(_BACKFILL_CHUNK)
+            ).all()
+            if not rows:
+                break
+            last = rows[-1][0]
+            values = [
+                {"record_uuid": uuid, "tag": key}
+                for uuid, tags in rows
+                for key in sorted({tag_key(t) for t in (tags or []) if isinstance(t, str) and t})
+            ]
+            if values:
+                try:
+                    conn.execute(RecordTag.__table__.insert(), values)
+                    total += len(values)
+                except Exception as exc:  # a peer without the lock (old core) raced us
+                    if not _is_duplicate(exc):
+                        raise
+    if total:
+        log.info(f"DB: backfilled {total} record tag(s) into itsm_record_tags")
+
+
+def _is_duplicate(exc: BaseException) -> bool:
+    return db_error_code(exc) == 1062 or "unique constraint" in str(getattr(exc, "orig", exc)).lower()
 
 
 # ── Sessions ──────────────────────────────────────────────────────────────────

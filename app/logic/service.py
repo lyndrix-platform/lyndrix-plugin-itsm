@@ -36,13 +36,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
 from ..model.database import ensure_tables, get_session, is_retryable, retry_write
-from ..model.models import Attachment, CiLink, Counter, JournalEntry, Record, RecordLink
+from ..model.models import (
+    Attachment,
+    CiLink,
+    Counter,
+    JournalEntry,
+    Record,
+    RecordLink,
+    RecordTag,
+    tag_key,
+)
 from . import attachments as att
 from .catalog import (
     CI_LINK_ROLES,
@@ -78,6 +87,8 @@ _PROBLEM_TEXT = {
     "catalog_dir_missing": "Configured catalog directory is missing on this instance — using the built-in catalog",
 }
 JOURNAL_USER_KINDS = ("comment", "work_note")
+# Hard cap of one list page — list_records never materialises more rows.
+MAX_PAGE_SIZE = 1000
 
 # Fields a PATCH may touch. state is changed only via transition(); identity
 # and gateway keys never change after create.
@@ -327,6 +338,14 @@ class ItsmService:
         s.add(entry)
         return entry
 
+    def _sync_tags(self, s, record_uuid: str, tags: list[str] | None, *, replace: bool) -> None:
+        """Mirror ``Record.tags`` into ``itsm_record_tags`` (SQL tag filter).
+        The record row must already be flushed (FK)."""
+        if replace:
+            s.execute(delete(RecordTag).where(RecordTag.record_uuid == record_uuid))
+        for key in sorted({tag_key(t) for t in tags or [] if t}):
+            s.add(RecordTag(record_uuid=record_uuid, tag=key))
+
     def _get(self, s, ref: str) -> Record | None:
         """Fetch by uuid or by human number (INC0000042)."""
         rec = s.get(Record, ref) if len(ref) == 36 else None
@@ -465,7 +484,8 @@ class ItsmService:
                     external_url=(data.get("external_url") or None),
                 )
                 s.add(rec)
-                s.flush()  # parent row first — CiLink/Journal FKs reference it
+                s.flush()  # parent row first — CiLink/Journal/Tag FKs reference it
+                self._sync_tags(s, rec.uuid, rec.tags, replace=False)
                 for link in ci_links:
                     s.add(CiLink(record_uuid=rec.uuid, **link))
                 self._journal(s, rec.uuid, "system", author, "created",
@@ -543,31 +563,44 @@ class ItsmService:
         ci: str | None = None, q: str | None = None, include_closed: bool = False,
         limit: int = 200, offset: int = 0,
     ) -> dict:
+        """One page of records, newest first: ``{"total", "records"}``.
+
+        Filtering, counting and paging all happen in SQL — the table grows
+        with every monitoring outage, so no request may materialise more than
+        one page (``limit`` is clamped to ``MAX_PAGE_SIZE``). ``total`` is the
+        number of records matching the filters, independent of the page.
+        """
         self._require_ready()
+        limit = max(1, min(int(limit), MAX_PAGE_SIZE))
+        offset = max(0, int(offset))
+        conditions = []
+        if not include_closed:
+            conditions.append(Record.closed_at.is_(None))
+        if record_type:
+            conditions.append(Record.record_type == record_type)
+        if state:
+            conditions.append(Record.state == state)
+        if priority:
+            conditions.append(Record.priority == priority)
+        if assignee:
+            conditions.append(Record.assignee == assignee)
+        if assignment_group:
+            conditions.append(Record.assignment_group == assignment_group)
+        if ci:
+            conditions.append(Record.uuid.in_(select(CiLink.record_uuid).where(CiLink.entity_uuid == ci)))
+        if tag:
+            conditions.append(Record.uuid.in_(select(RecordTag.record_uuid).where(RecordTag.tag == tag_key(tag))))
+        if q and q.strip():
+            like = f"%{q.strip()}%"
+            conditions.append(or_(Record.number.like(like), Record.title.like(like)))
         with get_session() as s:
-            stmt = select(Record)
-            if not include_closed:
-                stmt = stmt.where(Record.closed_at.is_(None))
-            if record_type:
-                stmt = stmt.where(Record.record_type == record_type)
-            if state:
-                stmt = stmt.where(Record.state == state)
-            if priority:
-                stmt = stmt.where(Record.priority == priority)
-            if assignee:
-                stmt = stmt.where(Record.assignee == assignee)
-            if assignment_group:
-                stmt = stmt.where(Record.assignment_group == assignment_group)
-            if ci:
-                stmt = stmt.where(Record.uuid.in_(select(CiLink.record_uuid).where(CiLink.entity_uuid == ci)))
-            if q:
-                like = f"%{q.strip()}%"
-                stmt = stmt.where(or_(Record.number.like(like), Record.title.like(like)))
-            rows = s.execute(stmt.order_by(Record.opened_at.desc())).scalars().all()
-            if tag:  # JSON list → filter in Python (portable across MariaDB/SQLite)
-                rows = [r for r in rows if tag in (r.tags or [])]
-            total = len(rows)
-            rows = rows[offset: offset + limit]
+            total = s.execute(select(func.count()).select_from(Record).where(*conditions)).scalar_one()
+            rows = s.execute(
+                select(Record).where(*conditions)
+                # number as tie-breaker keeps pages stable for equal timestamps
+                .order_by(Record.opened_at.desc(), Record.number.desc())
+                .limit(limit).offset(offset)
+            ).scalars().all()
             uuids = [r.uuid for r in rows]
             ci_counts: dict[str, int] = {}
             if uuids:
@@ -576,7 +609,7 @@ class ItsmService:
                     .group_by(CiLink.record_uuid)
                 ).all():
                     ci_counts[ru] = n
-            return {"total": total, "records": [{**r.to_dict(), "ci_count": ci_counts.get(r.uuid, 0)} for r in rows]}
+            return {"total": int(total), "records": [{**r.to_dict(), "ci_count": ci_counts.get(r.uuid, 0)} for r in rows]}
 
     # ── Update / transition ──────────────────────────────────────────────────
 
@@ -634,6 +667,8 @@ class ItsmService:
                     rec.priority = new_prio
             if not diff:
                 return self._detail(s, rec), {}
+            if "tags" in diff:
+                self._sync_tags(s, rec.uuid, rec.tags, replace=True)
             self._journal(s, rec.uuid, "field_change", author, None, {"changes": diff})
             self._bump_version(s, rec, base_version)
             s.commit()

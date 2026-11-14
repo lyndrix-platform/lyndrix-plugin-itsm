@@ -10,6 +10,7 @@ JournalEntry— append-only timeline: comments, work notes, state and field
               changes, links. Never updated or deleted → the audit trail.
 CiLink      — record ↔ configuration item (Entity Registry UUID). The display
               name/type are cached so the UI works while the registry is down.
+RecordTag   — indexed mirror of ``Record.tags`` for the SQL tag filter.
 RecordLink  — record ↔ record (parent/child, caused_by, implements, …).
 Attachment  — file metadata; bytes live on disk under the configured dir.
 Counter     — per-type sequence for human numbers (INC0000042); incremented
@@ -21,6 +22,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -45,6 +47,9 @@ class Record(_Base):
         # Idempotency key for records pushed in by a gateway/connector; native
         # records keep both NULL (NULLs never collide in a unique index).
         UniqueConstraint("source", "external_id", name="uq_itsm_source_ext"),
+        # The default list ("open records, newest first") and the open count of
+        # health()/stats: closed_at IS NULL ORDER BY opened_at DESC.
+        Index("ix_itsm_records_closed_opened", "closed_at", "opened_at"),
     )
 
     uuid = Column(String(36), primary_key=True)
@@ -118,6 +123,24 @@ class Record(_Base):
             "created_at": _iso(self.created_at),
             "updated_at": _iso(self.updated_at),
         }
+
+
+TAG_KEY_LENGTH = 128
+
+
+def tag_key(tag: str) -> str:
+    """A tag as stored in ``itsm_record_tags`` (bounded so it fits an index)."""
+    return tag[:TAG_KEY_LENGTH]
+
+
+class RecordTag(_Base):
+    """One row per (record, tag) — the indexed mirror of ``Record.tags`` so the
+    list filter ``?tag=`` runs in SQL (a JSON column cannot be indexed portably
+    across MariaDB and SQLite). ``Record.tags`` stays the source of truth."""
+    __tablename__ = "itsm_record_tags"
+
+    record_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), primary_key=True)
+    tag = Column(String(TAG_KEY_LENGTH), primary_key=True, index=True)
 
 
 class JournalEntry(_Base):
