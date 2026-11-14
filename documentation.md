@@ -304,7 +304,10 @@ gegen die gemeinsame MariaDB.
   die Markierung mindestens einer anderen lebenden Instanz, gilt das Verzeichnis als geteilt.
   Sind andere Instanzen aktiv, aber keine ihrer Markierungen sichtbar, melden `health()` und der
   Runtime-Status `degraded` (`attachment_dir_not_shared`, Banner, nicht blockierend). Ohne
-  lebende Nachbarn bleibt der Zustand „unbekannt“ (kein `degraded`). Die Prüfung wird 60 s gecacht.
+  lebende Nachbarn bleibt der Zustand „unbekannt“ (kein `degraded`). Die Prüfung läuft alle 60 s im
+  Hintergrund in einem eigenen Thread (höchstens eine gleichzeitig); `health()` liest nur das
+  Ergebnis. Antwortet das Verzeichnis länger als 10 s nicht (hängender NFS-/RWX-Mount), meldet
+  `health()` `degraded` (`attachment_dir_unresponsive`).
 - **Pfade:** `storage_path` wird seit 0.2.0 **relativ** zu `attachment_dir` gespeichert
   (`<record>/<attachment>`); absolute Pfade älterer Datensätze werden weiterhin gelesen.
 - **Nummernvergabe** läuft in einer eigenen kurzen READ-COMMITTED-Transaktion

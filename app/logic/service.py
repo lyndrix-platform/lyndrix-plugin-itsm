@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,11 +58,19 @@ log = get_logger("Plugin:ITSM:Service")
 
 SOURCE_ID = "itsm"
 CATALOG_RELOADED_TOPIC = "itsm:catalog_reloaded"
-# health() is polled by every dashboard: the attachment-dir probe (write test +
-# cluster marker) runs at most this often.
+# The attachment-dir probe (write test + cluster marker) is refreshed in the
+# background at this interval; health() only ever reads its cached result.
 STORAGE_CHECK_TTL = 60.0
+# A probe still running after this many seconds means the mount hangs (NFS /
+# share-manager down): health reports ``attachment_dir_unresponsive``.
+STORAGE_PROBE_STUCK_AFTER = 10.0
+# Upper bound a caller of storage_check() waits for a running probe.
+STORAGE_PROBE_WAIT = 5.0
 _PROBLEM_TEXT = {
     "attachment_dir_not_writable": "Attachment directory is not writable",
+    "attachment_dir_unresponsive": (
+        "Attachment directory does not respond (hung NFS/RWX mount?) — uploads and downloads will fail"
+    ),
     "attachment_dir_not_shared": (
         "Attachment directory is not shared with the other instances — mount it as an "
         "RWX/NFS volume, otherwise attachments uploaded elsewhere are missing here"
@@ -122,6 +131,17 @@ def _parse_dt(value) -> datetime | None:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
+class _StorageProbe:
+    """One run of the attachment-dir probe on its own daemon thread."""
+
+    __slots__ = ("root", "started", "done")
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.started = time.monotonic()
+        self.done = threading.Event()
+
+
 class ItsmService:
     def __init__(self) -> None:
         self._ctx = None
@@ -138,6 +158,8 @@ class ItsmService:
         # Operator catalog_dir that does not exist on this instance (health → degraded).
         self.catalog_dir_missing: str | None = None
         self._storage_cache: tuple[float, dict] | None = None
+        self._probe: _StorageProbe | None = None  # the single in-flight (or last) probe
+        self._probe_lock = threading.Lock()
         self._status_message: str | None = None  # last degraded message sent via set_status
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -982,19 +1004,12 @@ class ItsmService:
                      if i.get("alive") and not i.get("is_self") and i.get("instance_id")]
         return mode, (str(me) if me else None), peers
 
-    def storage_check(self, *, force: bool = False) -> dict:
-        """Probe the attachment directory (cached for ``STORAGE_CHECK_TTL``).
-
-        Single mode: writable or not. Cluster mode: also refresh this
-        instance's marker and look for the markers of the other live instances;
-        ``shared`` is True when at least one is visible, False when peers are
-        alive but none is visible, None when there is no live peer to compare.
-        """
-        now = time.monotonic()
-        cached = self._storage_cache
-        if not force and cached and now - cached[0] < STORAGE_CHECK_TTL:
-            return cached[1]
-        root = self.attachment_dir
+    def _probe_storage(self, root: Path) -> dict:
+        """The blocking probe itself. Single mode: writable or not. Cluster
+        mode: also refresh this instance's marker and look for the markers of
+        the other live instances; ``shared`` is True when at least one is
+        visible, False when peers are alive but none is visible, None when
+        there is no live peer to compare."""
         mode, me, peers = self._cluster_view()
         info: dict = {"writable": att.dir_writable(root), "cluster_mode": mode}
         if mode == "cluster":
@@ -1006,12 +1021,91 @@ class ItsmService:
             visible = att.visible_markers(root, peers)
             info.update(peers=len(peers), peers_visible=len(visible),
                         shared=(bool(visible) if peers else None))
-        self._storage_cache = (now, info)
         return info
+
+    def _probe_in_flight(self) -> _StorageProbe | None:
+        """The running probe of the *current* attachment dir, if any."""
+        probe = self._probe
+        if probe is not None and not probe.done.is_set() and probe.root == self.attachment_dir:
+            return probe
+        return None
+
+    def start_storage_probe(self) -> _StorageProbe:
+        """Make sure a probe of the attachment dir is running — never blocks.
+
+        Single-flight: while a probe is in flight no second one is started, so
+        a hung mount (the syscalls never return) costs exactly one dedicated
+        daemon thread instead of one worker of the shared ``to_thread``
+        executor per caller. Only a changed ``attachment_dir`` supersedes a
+        running probe (its result is discarded) — otherwise moving the
+        directory off a dead mount could never clear the problem.
+        """
+        with self._probe_lock:
+            probe = self._probe_in_flight()
+            if probe is not None:
+                return probe
+            probe = _StorageProbe(self.attachment_dir)
+            self._probe = probe
+        threading.Thread(target=self._run_storage_probe, args=(probe,),
+                         name="itsm-storage-probe", daemon=True).start()
+        return probe
+
+    def _run_storage_probe(self, probe: _StorageProbe) -> None:
+        try:
+            info = self._probe_storage(probe.root)
+        except Exception as exc:  # never let the probe thread die silently
+            log.warning(f"ITSM: attachment storage probe failed — {exc}")
+            info = {"writable": False, "cluster_mode": "single", "error": str(exc)}
+        with self._probe_lock:
+            current = self._probe is probe
+            if current:
+                self._storage_cache = (time.monotonic(), info)
+        probe.done.set()
+        if current:
+            try:
+                self.sync_runtime_status()
+            except Exception as exc:
+                log.debug(f"ITSM: runtime status sync after probe failed — {exc}")
+
+    def storage_snapshot(self) -> dict:
+        """The last probe result — a pure read that never touches the disk.
+
+        ``{"unresponsive": True}`` while a probe has been running for longer
+        than ``STORAGE_PROBE_STUCK_AFTER``; ``{"pending": True}`` before the
+        first result. The background refresher (entrypoint) keeps the result
+        fresh; should it not be running, a result older than two intervals
+        triggers a (single-flight, non-blocking) probe from here.
+        """
+        now = time.monotonic()
+        probe = self._probe_in_flight()
+        if probe is not None and now - probe.started > STORAGE_PROBE_STUCK_AFTER:
+            return {"writable": None, "unresponsive": True,
+                    "probe_running_s": round(now - probe.started, 1)}
+        cached = self._storage_cache
+        if cached is None:
+            if probe is None:
+                self.start_storage_probe()
+            return {"writable": None, "pending": True}
+        if probe is None and now - cached[0] > 2 * STORAGE_CHECK_TTL:
+            self.start_storage_probe()
+        return cached[1]
+
+    def storage_check(self, *, force: bool = False, wait: float = STORAGE_PROBE_WAIT) -> dict:
+        """Probe result, refreshed when older than ``STORAGE_CHECK_TTL`` (or
+        ``force``). The probe runs on its own thread; this call waits at most
+        ``wait`` seconds for it and then returns :meth:`storage_snapshot`, so
+        a hung mount can hold the calling worker thread only briefly."""
+        cached = self._storage_cache
+        if not force and cached and time.monotonic() - cached[0] < STORAGE_CHECK_TTL:
+            return cached[1]
+        self.start_storage_probe().done.wait(wait)
+        return self.storage_snapshot()
 
     def problems(self, storage: dict) -> list[str]:
         out = []
-        if not storage.get("writable"):
+        if storage.get("unresponsive"):
+            out.append("attachment_dir_unresponsive")
+        elif storage.get("writable") is False:  # None = no result yet, not a problem
             out.append("attachment_dir_not_writable")
         if storage.get("shared") is False:
             out.append("attachment_dir_not_shared")
@@ -1021,8 +1115,10 @@ class ItsmService:
 
     def health_report(self) -> tuple[str, dict]:
         """``(status, details)`` for the plugin ``health()`` hook — one cheap
-        count plus the cached storage probe; also syncs the runtime status
-        banner (``degraded``, non-blocking) with the problems found."""
+        count plus the *cached* storage probe (never a disk access: a hung
+        mount must not block one worker thread per dashboard poll); also syncs
+        the runtime status banner (``degraded``, non-blocking) with the
+        problems found."""
         self._require_ready()
         with get_session() as s:
             open_count = s.execute(
@@ -1036,7 +1132,7 @@ class ItsmService:
         }
         if not loaded:
             return "error", {**details, "reason": "catalog_not_loaded"}
-        storage = self.storage_check()
+        storage = self.storage_snapshot()
         details["attachment_storage"] = storage
         if self.catalog_dir_missing:
             details["catalog_dir_missing"] = self.catalog_dir_missing
@@ -1051,7 +1147,7 @@ class ItsmService:
         non-blocking ``degraded`` banner while any exist, ``ready`` once they
         are gone. Only phase/message changes are sent."""
         if problems is None:
-            problems = self.problems(self.storage_check())
+            problems = self.problems(self.storage_snapshot())
         set_status = getattr(self._ctx, "set_status", None)
         if not callable(set_status):
             return

@@ -466,6 +466,7 @@ def test_cluster_storage_not_shared_reports_degraded(svc):
     from app.logic import attachments as att
 
     svc.set_context(_ClusterCtx(peers=("b",)))
+    svc.storage_check(force=True)  # health() itself only reads the cached probe
     status, details = svc.health_report()
     assert status == "degraded" and details["reason"] == "attachment_dir_not_shared"
     assert details["attachment_storage"]["shared"] is False
@@ -486,6 +487,7 @@ def test_cluster_storage_not_shared_reports_degraded(svc):
 
 def test_cluster_storage_without_live_peers_is_unknown_not_degraded(svc):
     svc.set_context(_ClusterCtx(peers=()))
+    svc.storage_check(force=True)
     status, details = svc.health_report()
     assert status == "ok" and details["attachment_storage"]["shared"] is None
 
@@ -501,11 +503,87 @@ def test_storage_check_is_cached(svc, monkeypatch):
         return real(path)
 
     monkeypatch.setattr(att, "dir_writable", _count)
-    svc.health_report()
+    svc.storage_check()
+    svc.storage_check()
     svc.health_report()
     assert calls["n"] == 1
     svc.storage_check(force=True)
     assert calls["n"] == 2
+
+
+def test_hung_attachment_dir_never_costs_more_than_one_probe_thread(svc, monkeypatch):
+    """IT-01: a mount that hangs must not block one worker per health poll."""
+    import threading
+    import time
+
+    from app.logic import attachments as att
+    from app.logic import service as service_mod
+
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def _hang(path):
+        calls["n"] += 1
+        release.wait(30)
+        return True
+
+    monkeypatch.setattr(att, "dir_writable", _hang)
+    monkeypatch.setattr(service_mod, "STORAGE_PROBE_STUCK_AFTER", 0.2)
+    svc.set_context(_ClusterCtx(peers=()))
+
+    def _probe_threads() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "itsm-storage-probe" and t.is_alive())
+
+    async def _poll():
+        return await asyncio.gather(*[asyncio.to_thread(svc.health_report) for _ in range(20)])
+
+    try:
+        start = time.monotonic()
+        first = asyncio.run(_poll())
+        assert time.monotonic() - start < 1.0
+        assert {status for status, _ in first} == {"ok"}  # no result yet is not a problem
+        assert first[0][1]["attachment_storage"] == {"writable": None, "pending": True}
+        time.sleep(0.3)
+        start = time.monotonic()
+        later = asyncio.run(_poll())
+        assert time.monotonic() - start < 1.0
+        assert {(status, d["reason"]) for status, d in later} == {("degraded", "attachment_dir_unresponsive")}
+        svc.start_storage_probe()
+        assert svc.storage_check(force=True, wait=0.05)["unresponsive"] is True
+        assert calls["n"] == 1 and _probe_threads() == 1
+        assert svc._ctx.statuses[-1][0] == "degraded"
+    finally:
+        release.set()
+    svc._probe.done.wait(5)
+    status, details = svc.health_report()
+    assert status == "ok" and details["attachment_storage"]["writable"] is True
+    assert svc._ctx.statuses[-1][0] == "ready"
+
+
+def test_changed_attachment_dir_supersedes_a_hung_probe(svc, monkeypatch, tmp_path):
+    """Moving the directory off a dead mount must clear the problem."""
+    import threading
+
+    from app.logic import attachments as att
+
+    release = threading.Event()
+    real = att.dir_writable
+    dead = svc.attachment_dir
+
+    def _writable(path):
+        if path == dead:
+            release.wait(30)
+        return real(path)
+
+    monkeypatch.setattr(att, "dir_writable", _writable)
+    try:
+        stuck = svc.start_storage_probe()
+        svc.apply_settings({"attachment_dir": str(tmp_path / "moved")})
+        assert svc.storage_check(force=True)["writable"] is True
+    finally:
+        release.set()
+    stuck.done.wait(5)
+    assert svc.storage_snapshot()["writable"] is True  # the stale probe's result was discarded
 
 
 def test_settings_apply_catalog_dir_and_report_missing(svc, tmp_path):

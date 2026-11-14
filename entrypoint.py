@@ -76,6 +76,7 @@ from .app.api import RecordCreate, build_plugin_router
 from .app.logic import maintenance_tasks, monitoring_incidents
 from .app.logic.service import (
     CATALOG_RELOADED_TOPIC,
+    STORAGE_CHECK_TTL,
     ItsmError,
     NotFound,
     TransitionError,
@@ -239,7 +240,8 @@ def setup(ctx):
     async def _apply_settings(reason: str) -> None:
         def _run() -> None:  # Vault + disk I/O are blocking
             svc.apply_settings(ctx.get_all_settings() or {})
-            svc.storage_check(force=True)  # writes this instance's cluster marker
+            # Writes this instance's cluster marker; waits only briefly for the probe.
+            svc.storage_check(force=True)
             svc.sync_runtime_status()
         try:
             await asyncio.to_thread(_run)
@@ -266,14 +268,19 @@ def setup(ctx):
         except Exception as exc:
             ctx.log.error(f"ITSM: catalog reload from peer failed — {exc}")
 
-    # Announce this instance in the attachment dir right away (cluster sharing check).
-    async def _initial_storage_check() -> None:
-        try:
-            await asyncio.to_thread(lambda: (svc.storage_check(force=True), svc.sync_runtime_status()))
-        except Exception as exc:
-            ctx.log.debug(f"ITSM: initial storage check failed — {exc}")
+    # Attachment-dir probe (write test + cluster marker): refreshed here in the
+    # background, on a dedicated single-flight thread, so health() only reads
+    # the cached result and a hung mount can never eat the shared executor.
+    # Runs on every instance — each one checks its own mount (no lease).
+    async def _storage_probe_loop() -> None:
+        while True:
+            try:
+                svc.start_storage_probe()  # non-blocking; no-op while one is in flight
+            except Exception as exc:
+                ctx.log.debug(f"ITSM: storage probe could not start — {exc}")
+            await asyncio.sleep(STORAGE_CHECK_TTL)
 
-    ctx.create_task(_initial_storage_check(), name="itsm:storage_check")
+    ctx.create_task(_storage_probe_loop(), name="itsm:storage_probe")
 
     # ── Inbound bus API ──────────────────────────────────────────────────────
     def _fail(topic: str, error: str) -> None:
