@@ -13,6 +13,8 @@ CiLink      — record ↔ configuration item (Entity Registry UUID). The displa
 RecordTag   — indexed mirror of ``Record.tags`` for the SQL tag filter.
 RecordLink  — record ↔ record (parent/child, caused_by, implements, …).
 Attachment  — file metadata; bytes live on disk under the configured dir.
+IngestTombstone — "this external record already ended" memo for events that
+              overtake the event creating the record.
 Counter     — per-type sequence for human numbers (INC0000042); incremented
               under a row lock inside the create transaction.
 """
@@ -239,6 +241,20 @@ class Attachment(_Base):
             "uploaded_by": self.uploaded_by,
             "created_at": _iso(self.created_at),
         }
+
+
+class IngestTombstone(_Base):
+    """A fact about a pushed-in record that arrived *before* the record itself
+    (e.g. ``monitoring:outage_recovered`` ahead of ``outage_persisted``). The
+    ingest handler that later creates ``(source, external_id)`` consumes it.
+    Rows expire (``expires_at``) and are purged on the next write."""
+    __tablename__ = "itsm_ingest_tombstones"
+
+    source = Column(String(64), primary_key=True)
+    external_id = Column(String(255), primary_key=True)
+    data = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    expires_at = Column(DateTime, nullable=False, index=True)
 
 
 class Counter(_Base):

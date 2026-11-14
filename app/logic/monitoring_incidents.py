@@ -14,6 +14,10 @@ Rules the contract fixes (``features/maintenance-windows/00-ergebnis-p0.md``):
   (``"<ci_id>:<since>"``), and by "an open incident of this source already
   links the CI" → work note instead of a second record;
 * a new outage after ``resolved`` opens a **new** incident (no reopen);
+* events may arrive out of order: a recovery that finds no incident is
+  remembered for 24 h (``itsm_ingest_tombstones``), and the ``persisted`` event
+  that then creates the incident applies it right away — the incident never
+  stays open for an outage that is already over;
 * the service CI is ``affected``, its host ``related``;
 * auto-resolve uses resolution code ``auto_recovered``; when the catalog does
   not allow the transition (``on_hold``) a comment is left instead;
@@ -53,6 +57,9 @@ SEVERITY_TO_IMPACT_URGENCY: dict[str, tuple[int, int]] = {
     "low": (3, 2),
 }
 DEFAULT_SEVERITY = "high"
+#: How long an ``outage_recovered`` that found no incident is remembered so a
+#: late ``outage_persisted`` of the same outage still gets closed out.
+RECOVERY_MEMO_SECONDS = 24 * 3600.0
 
 
 def impact_urgency(severity: object) -> tuple[int, int]:
@@ -168,6 +175,18 @@ class MonitoringIncidents(EventIngest):
         log.info(
             f"ITSM: opened {record['number']} ({record['priority']}) for outage {outage_id}"
         )
+        # The recovery may have overtaken us (we await registry lookups between
+        # the dedupe check and the insert): apply the remembered one now.
+        recovery = await self._take_remembered(outage_id)
+        if recovery is not None:
+            log.info(
+                f"ITSM: outage {outage_id} had already recovered — closing out {record['number']}"
+            )
+            await self._close_out(
+                record,
+                fmt_ts(recovery.get("recovered_at")),
+                fmt_duration(recovery.get("duration_s")),
+            )
         return str(record["uuid"])
 
     # ── outage_recovered ───────────────────────────────────────────────────
@@ -188,6 +207,12 @@ class MonitoringIncidents(EventIngest):
             )
             return str(record["uuid"])
 
+        await self._close_out(record, recovered_at, duration)
+        return str(record["uuid"])
+
+    async def _close_out(self, record: dict, recovered_at: str, duration: str) -> None:
+        """The outage of this (open) incident is over: auto-resolve, or leave a
+        comment when its rule says ``auto_resolve: false``."""
         if self._rule_of(record).get("auto_resolve", True):
             await self._auto_resolve(record, recovered_at, duration)
         else:
@@ -200,7 +225,6 @@ class MonitoringIncidents(EventIngest):
                     duration=duration,
                 ),
             )
-        return str(record["uuid"])
 
     async def _recovered_without_incident(
         self, data: dict, outage_id: str, recovered_at: str, duration: str
@@ -210,8 +234,7 @@ class MonitoringIncidents(EventIngest):
         ci_id = self._ci(data, "ci_id", required=False)
         open_incident = await self._find_open_for_ci(ci_id) if ci_id else None
         if open_incident is None:
-            log.info(f"ITSM: no incident for recovered outage {outage_id}")
-            return None
+            return await self._remember_recovery(data, outage_id, recovered_at, duration)
         await self._journal(
             open_incident["uuid"],
             "work_note",
@@ -224,6 +247,32 @@ class MonitoringIncidents(EventIngest):
             ),
         )
         return str(open_incident["uuid"])
+
+    async def _remember_recovery(
+        self, data: dict, outage_id: str, recovered_at: str, duration: str
+    ) -> str | None:
+        """Nothing to resolve (yet). ``outage_persisted`` of this outage may
+        still be on its way — remember the recovery so that handler closes the
+        incident it creates. Then look once more: the incident may have been
+        inserted between our lookup and the memo (both sides write first and
+        check afterwards, so one of them always sees the other)."""
+        await self._remember(
+            outage_id,
+            {
+                "recovered_at": data.get("recovered_at"),
+                "duration_s": data.get("duration_s"),
+            },
+            ttl_seconds=RECOVERY_MEMO_SECONDS,
+        )
+        record = await self._find_by_external(outage_id)
+        if record is None:
+            log.info(
+                f"ITSM: no incident for recovered outage {outage_id} — remembered for a late outage_persisted"
+            )
+            return None
+        if await self._take_remembered(outage_id) is not None and self._is_open(record):
+            await self._close_out(record, recovered_at, duration)
+        return str(record["uuid"])
 
     @staticmethod
     def _rule_of(record: dict) -> dict:

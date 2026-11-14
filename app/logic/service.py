@@ -32,7 +32,7 @@ import asyncio
 import functools
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -46,6 +46,7 @@ from ..model.models import (
     Attachment,
     CiLink,
     Counter,
+    IngestTombstone,
     JournalEntry,
     Record,
     RecordLink,
@@ -536,6 +537,52 @@ class ItsmService:
                 select(Record).where(Record.source == source, Record.external_id == external_id)
             ).scalar_one_or_none()
             return rec.to_dict() if rec else None
+
+    # ── Ingest tombstones (events that overtake the record they refer to) ────
+
+    def remember_ingest_event(self, source: str, external_id: str, data: dict,
+                              *, ttl_seconds: float) -> bool:
+        """Remember ``data`` for a record ``(source, external_id)`` that does
+        not exist yet. The first memo wins (a re-delivered event changes
+        nothing); expired memos are purged on the way. → True when stored."""
+        self._require_ready()
+        now = _now()
+
+        def _tx() -> bool:
+            with get_session() as s:
+                s.execute(delete(IngestTombstone).where(IngestTombstone.expires_at < now))
+                if s.get(IngestTombstone, (source, external_id)) is not None:
+                    s.commit()
+                    return False
+                s.add(IngestTombstone(source=source, external_id=external_id, data=dict(data),
+                                      created_at=now, expires_at=now + timedelta(seconds=ttl_seconds)))
+                s.commit()
+                return True
+
+        try:
+            return retry_write(_tx)
+        except IntegrityError:  # a peer instance stored the same memo first
+            return False
+
+    def take_ingest_event(self, source: str, external_id: str) -> dict | None:
+        """Consume the memo of ``(source, external_id)``: its data, or None when
+        there is none (or it expired). The DELETE decides — of several
+        concurrent takers exactly one gets it."""
+        self._require_ready()
+        now = _now()
+
+        def _tx() -> dict | None:
+            with get_session() as s:
+                row = s.get(IngestTombstone, (source, external_id))
+                if row is None:
+                    return None
+                data, expired = dict(row.data or {}), row.expires_at < now
+                res = s.execute(delete(IngestTombstone).where(
+                    IngestTombstone.source == source, IngestTombstone.external_id == external_id))
+                s.commit()
+                return data if res.rowcount == 1 and not expired else None
+
+        return retry_write(_tx)
 
     def find_open_for_ci(self, ci_id: str, *, record_type: str, source: str | None = None,
                          role: str = "affected") -> dict | None:

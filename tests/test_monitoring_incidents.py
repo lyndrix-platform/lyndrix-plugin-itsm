@@ -454,3 +454,41 @@ def test_texts_follow_the_configured_locale(incidents, svc):
         )
     )
     assert "nicht erreichbar seit" in svc.get_record(other)["title"]
+
+
+# ── IT-03: recovery overtakes outage_persisted ────────────────────────────────
+
+
+def test_recovered_before_persisted_closes_the_late_incident(incidents, svc):
+    assert run(incidents.handle_outage_recovered(recovered())) is None
+    run(incidents.handle_outage_recovered(recovered()))  # re-delivery: first memo wins
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    rec = svc.get_record(uuid)
+    assert rec["state"] == "resolved"
+    assert rec["custom_fields"]["resolution_code"] == "auto_recovered"
+    assert svc.take_ingest_event("monitoring", outage_id()) is None  # consumed
+
+
+def test_expired_recovery_memo_is_ignored(incidents, svc, monkeypatch):
+    from app.logic import monitoring_incidents as mod
+
+    monkeypatch.setattr(mod, "RECOVERY_MEMO_SECONDS", -1.0)
+    run(incidents.handle_outage_recovered(recovered()))
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    assert svc.get_record(uuid)["state"] == "new"
+
+
+def test_recovery_racing_the_insert_still_resolves(incidents, svc, monkeypatch):
+    """The incident is inserted between the recovery's lookup and its memo."""
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    real = incidents._find_by_external
+    calls = {"n": 0}
+
+    async def _stale_first(external_id):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else await real(external_id)
+
+    monkeypatch.setattr(incidents, "_find_by_external", _stale_first)
+    monkeypatch.setattr(incidents, "_find_open_for_ci", lambda ci: asyncio.sleep(0))
+    assert run(incidents.handle_outage_recovered(recovered())) == uuid
+    assert svc.get_record(uuid)["state"] == "resolved"
