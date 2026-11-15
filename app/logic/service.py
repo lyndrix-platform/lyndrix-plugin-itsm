@@ -612,6 +612,25 @@ class ItsmService:
             rec = s.execute(stmt.order_by(Record.opened_at.desc()).limit(1)).scalars().first()
             return rec.to_dict() if rec else None
 
+    def list_open_for_ci(self, ci_id: str, *, record_type: str, source: str | None = None,
+                         role: str = "affected") -> list[dict]:
+        """Every open record that ``find_open_for_ci`` would consider, OLDEST
+        first (``opened_at``, then uuid) — a total order two instances agree on,
+        used to pick the survivor when a race created duplicates."""
+        self._require_ready()
+        states = self.open_state_names(record_type)
+        with get_session() as s:
+            stmt = (
+                select(Record)
+                .join(CiLink, CiLink.record_uuid == Record.uuid)
+                .where(CiLink.entity_uuid == ci_id, CiLink.role == role,
+                       Record.record_type == record_type, Record.state.in_(states))
+            )
+            if source:
+                stmt = stmt.where(Record.source == source)
+            rows = s.execute(stmt.order_by(Record.opened_at.asc(), Record.uuid.asc())).scalars().all()
+            return [r.to_dict() for r in rows]
+
     def list_records(
         self, *, record_type: str | None = None, state: str | None = None,
         priority: str | None = None, assignee: str | None = None,

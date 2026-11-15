@@ -20,6 +20,9 @@ unchanged; no React source changed. New database objects are created idempotentl
   The response shape is unchanged (IT-02).
 - A `monitoring:outage_recovered` that overtakes its `outage_persisted` is remembered for 24 h and closes the incident
   as soon as it is created (IT-03).
+- Concurrent `monitoring:outage_persisted` events for one CI no longer open several incidents (MO-10): creation is
+  serialised per `ci_id` on an instance, and after the insert the oldest open monitoring incident of the CI survives
+  (a duplicate created by a peer instance is cancelled with a pointer to it, its outage is noted on the survivor).
 - Record links are unique per pair in the database; a concurrent duplicate link (records or CIs) is idempotent instead
   of HTTP 500, and unlink removes every matching row (IT-04).
 - Fields changed along with a transition are journalled with old and new values, and `itsm:record_updated` is emitted,

@@ -72,10 +72,45 @@ def impact_urgency(severity: object) -> tuple[int, int]:
     return SEVERITY_TO_IMPACT_URGENCY[DEFAULT_SEVERITY]
 
 
+class _RefLock:
+    """``async with`` an asyncio.Lock shared by everyone using the same key; the
+    map entry is dropped when the last user leaves, so the map holds only CIs
+    that are being processed right now (no unbounded growth)."""
+
+    def __init__(self, registry: dict, key: str) -> None:
+        self._registry = registry
+        self._key = key
+
+    async def __aenter__(self) -> None:
+        entry = self._registry.setdefault(self._key, [asyncio.Lock(), 0])
+        entry[1] += 1  # users, counted before awaiting: no await between lookup and increment
+        try:
+            await entry[0].acquire()
+        except BaseException:
+            self._release_ref(entry)
+            raise
+
+    async def __aexit__(self, *exc: object) -> None:
+        entry = self._registry[self._key]
+        entry[0].release()
+        self._release_ref(entry)
+
+    def _release_ref(self, entry: list) -> None:
+        entry[1] -= 1
+        if entry[1] <= 0:
+            self._registry.pop(self._key, None)
+
+
 class MonitoringIncidents(EventIngest):
     source = SOURCE
     author = AUTHOR
     record_type = "incident"
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # ci_id → [lock, users]; see _RefLock. Locks are bound to the running loop
+        # lazily (py3.10+), so one handler instance can serve several loops in tests.
+        self._ci_locks: dict[str, list] = {}
 
     # ── Public bus API ─────────────────────────────────────────────────────
 
@@ -103,6 +138,18 @@ class MonitoringIncidents(EventIngest):
         since = fmt_ts(data.get("since"))
         duration = fmt_duration(data.get("duration_s"))
 
+        # One outage at a time per CI: the steps below await registry lookups
+        # between "no open incident yet" and the insert, so concurrent events of
+        # the same CI (a burst from one evaluator pass) would all pass the check.
+        async with self._ci_lock(ci_id):
+            return await self._persisted_locked(
+                data, outage_id, ci_id, rule, host_ci_id, kind, name, since, duration
+            )
+
+    async def _persisted_locked(
+        self, data: dict, outage_id: str, ci_id: str, rule: dict,
+        host_ci_id: str | None, kind: str, name: str, since: str, duration: str,
+    ) -> str | None:
         # Dedupe 1 — this very outage was delivered before (or a peer handled it).
         existing = await self._find_by_external(outage_id)
         if existing is not None:
@@ -175,6 +222,31 @@ class MonitoringIncidents(EventIngest):
         log.info(
             f"ITSM: opened {record['number']} ({record['priority']}) for outage {outage_id}"
         )
+        # Write first, check afterwards: the lock only serialises this instance.
+        # A peer may have opened an incident for the same CI in the meantime.
+        survivor = await self._yield_to_older_incident(record, ci_id)
+        if survivor is not None:
+            await self._journal(
+                survivor["uuid"],
+                "work_note",
+                self.texts(
+                    "outage_repeated", name=name, since=since,
+                    duration=duration, outage_id=outage_id,
+                ),
+            )
+            recovery = await self._take_remembered(outage_id)
+            if recovery is not None:
+                await self._journal(
+                    survivor["uuid"],
+                    "work_note",
+                    self.texts(
+                        "recovered_additional", since=since,
+                        recovered_at=fmt_ts(recovery.get("recovered_at")),
+                        duration=fmt_duration(recovery.get("duration_s")),
+                        outage_id=outage_id,
+                    ),
+                )
+            return str(survivor["uuid"])
         # The recovery may have overtaken us (we await registry lookups between
         # the dedupe check and the insert): apply the remembered one now.
         recovery = await self._take_remembered(outage_id)
@@ -188,6 +260,50 @@ class MonitoringIncidents(EventIngest):
                 fmt_duration(recovery.get("duration_s")),
             )
         return str(record["uuid"])
+
+    def _ci_lock(self, ci_id: str) -> "_RefLock":
+        return _RefLock(self._ci_locks, ci_id)
+
+    async def _yield_to_older_incident(self, record: dict, ci_id: str) -> dict | None:
+        """Two instances (or a lost lock) may both have created an incident for
+        this CI. All open monitoring incidents of the CI are ordered oldest
+        first (``opened_at``, uuid) — every instance computes the same order, so
+        exactly one survives. Ours is cancelled when it is not the first;
+        returns the survivor then, None when ours stays.
+
+        Residual risk: clock skew between instances can rank a record that was
+        committed later as the oldest; the check of the one that finished first
+        then did not see it. A duplicate is possible only in that window."""
+        open_ones = await asyncio.to_thread(
+            self.service.list_open_for_ci,
+            ci_id, record_type=self.record_type, source=self.source,
+        )
+        if not open_ones or open_ones[0]["uuid"] == record["uuid"]:
+            return None
+        survivor = open_ones[0]
+        try:
+            await asyncio.to_thread(
+                self.service.transition,
+                record["uuid"],
+                "cancelled",
+                fields={"cancel_reason": self.texts("outage_duplicate_cancel", number=survivor["number"])},
+                note=self.texts(
+                    "outage_duplicate_note",
+                    outage_id=(record.get("external_id") or "—"), number=survivor["number"],
+                ),
+                author=self.author,
+            )
+        except ItsmError as exc:
+            # Cannot cancel (version conflict, someone already acted on it):
+            # keep it — a visible duplicate is better than a lost incident.
+            log.warning(
+                f"ITSM: duplicate incident {record['number']} of {survivor['number']} could not be cancelled ({exc})"
+            )
+            return None
+        log.info(
+            f"ITSM: {record['number']} cancelled — {survivor['number']} already covers CI {ci_id}"
+        )
+        return survivor
 
     # ── outage_recovered ───────────────────────────────────────────────────
 
