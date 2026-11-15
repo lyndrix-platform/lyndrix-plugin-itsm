@@ -4,9 +4,9 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the
 manifest `version` and the matching git tag.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-15
 
-Proposed version: **0.4.0** (reliability audit 2026-11; the manifest version is not bumped yet). Minimum core
+Reliability audit 2026-11. Minimum core
 unchanged; no React source changed. New database objects are created idempotently under the bootstrap lock: table
 `itsm_record_tags` (backfilled in chunks), table `itsm_ingest_tombstones`, column and unique index
 `itsm_record_links.pair_key` (existing inverse duplicates are removed, the oldest row wins), index

@@ -92,7 +92,7 @@ UI_RECORD_LINK = "/apps/lyndrix-plugin-itsm/itsm?record="
 manifest = ModuleManifest(
     id=PLUGIN_ID,
     name="IT Service Management",
-    version="0.3.0",
+    version="0.4.0",
     description=(
         "Incidents, changes, problems, requests and tasks with catalog-driven "
         "processes, audit journal, CI links and attachments. Native suite today, "
