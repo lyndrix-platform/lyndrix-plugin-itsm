@@ -454,3 +454,151 @@ def test_texts_follow_the_configured_locale(incidents, svc):
         )
     )
     assert "nicht erreichbar seit" in svc.get_record(other)["title"]
+
+
+# ── IT-03: recovery overtakes outage_persisted ────────────────────────────────
+
+
+def test_recovered_before_persisted_closes_the_late_incident(incidents, svc):
+    assert run(incidents.handle_outage_recovered(recovered())) is None
+    run(incidents.handle_outage_recovered(recovered()))  # re-delivery: first memo wins
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    rec = svc.get_record(uuid)
+    assert rec["state"] == "resolved"
+    assert rec["custom_fields"]["resolution_code"] == "auto_recovered"
+    assert svc.take_ingest_event("monitoring", outage_id()) is None  # consumed
+
+
+def test_expired_recovery_memo_is_ignored(incidents, svc, monkeypatch):
+    from app.logic import monitoring_incidents as mod
+
+    monkeypatch.setattr(mod, "RECOVERY_MEMO_SECONDS", -1.0)
+    run(incidents.handle_outage_recovered(recovered()))
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    assert svc.get_record(uuid)["state"] == "new"
+
+
+def test_recovery_racing_the_insert_still_resolves(incidents, svc, monkeypatch):
+    """The incident is inserted between the recovery's lookup and its memo."""
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    real = incidents._find_by_external
+    calls = {"n": 0}
+
+    async def _stale_first(external_id):
+        calls["n"] += 1
+        return None if calls["n"] == 1 else await real(external_id)
+
+    monkeypatch.setattr(incidents, "_find_by_external", _stale_first)
+    monkeypatch.setattr(incidents, "_find_open_for_ci", lambda ci: asyncio.sleep(0))
+    assert run(incidents.handle_outage_recovered(recovered())) == uuid
+    assert svc.get_record(uuid)["state"] == "resolved"
+
+
+# ── concurrent outage_persisted for one CI (MO-10, dedupe race) ───────────────
+
+
+def _slow_registry(handler, monkeypatch):
+    """Registry lookups really yield to the loop — the window between the dedupe
+    check and the insert in which concurrent events used to overtake each other."""
+    real = handler._ci_links
+
+    async def slow(*a, **kw):
+        await asyncio.sleep(0.05)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(handler, "_ci_links", slow)
+
+
+def _open_monitoring(svc) -> list[dict]:
+    return [r for r in _incidents(svc) if r["state"] in ("new", "in_progress")]
+
+
+def test_concurrent_outages_of_one_ci_open_exactly_one_incident(incidents, svc, monkeypatch):
+    _slow_registry(incidents, monkeypatch)
+    events = [
+        persisted(outage_id=outage_id(since=f"2026-10-18T01:00:0{i}Z"), since=f"2026-10-18T01:00:0{i}Z")
+        for i in range(5)
+    ]
+
+    async def main():
+        return await asyncio.gather(*(incidents.handle_outage_persisted(e) for e in events))
+
+    uuids = run(main())
+    assert len(_incidents(svc)) == 1 and len(set(uuids)) == 1 and not _failures(svc)
+    notes = [j for j in svc.get_record(uuids[0])["journal"] if j["kind"] == "work_note"]
+    assert len(notes) == 4  # the other four were annotated, not opened
+    assert incidents._ci_locks == {}  # the lock map does not keep finished CIs
+
+
+def test_ci_lock_is_per_ci_and_cleans_up(incidents):
+    async def main():
+        async with incidents._ci_lock(SERVICE_CI):
+            async with incidents._ci_lock(OTHER_CI):  # another CI is not blocked
+                assert set(incidents._ci_locks) == {SERVICE_CI, OTHER_CI}
+            waiter = asyncio.ensure_future(incidents._ci_lock(SERVICE_CI).__aenter__())
+            await asyncio.sleep(0.01)
+            assert not waiter.done()  # same CI waits
+            assert incidents._ci_locks[SERVICE_CI][1] == 2
+        await waiter
+        await incidents._ci_lock(SERVICE_CI).__aexit__(None, None, None)
+
+    run(main())
+    assert incidents._ci_locks == {}
+
+
+def test_peer_instance_inserting_in_the_window_leaves_one_open_incident(incidents, svc, monkeypatch):
+    """A peer instance (own lock) commits an incident for the same CI while we
+    await the registry: our write-then-check sees it, cancels ours and points
+    at it. Driven deterministically — the SQLite test DB is single-connection."""
+    real = incidents._ci_links
+    peer = {}
+
+    async def with_peer_insert(*a, **kw):
+        links = await real(*a, **kw)
+        peer.update(svc.create_record(
+            {"record_type": "incident", "title": "peer", "source": "monitoring",
+             "external_id": outage_id(since=SINCE_2), "ci_links": links},
+            author="monitoring"))
+        return links
+
+    monkeypatch.setattr(incidents, "_ci_links", with_peer_insert)
+    # The peer record is "older": backdate it so the order is unambiguous.
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    recs = _incidents(svc)
+    mine = next(r for r in recs if r["external_id"] == outage_id())
+    if uuid == peer["uuid"]:  # peer ranked oldest (same-second opened_at → uuid order)
+        assert mine["state"] == "cancelled"
+        survivor = peer
+    else:  # we ranked oldest: the peer's own check would cancel it
+        assert uuid == mine["uuid"] and mine["state"] != "cancelled"
+        survivor = mine
+    assert survivor["number"]
+
+
+def test_duplicate_is_cancelled_in_favour_of_the_oldest(incidents, svc):
+    """Directly exercise the write-then-check: two open incidents for the CI,
+    the younger one yields and the survivor gets the note."""
+    from datetime import timedelta
+
+    from app.model.database import get_session
+    from app.model import models
+
+    links = [{"entity_uuid": SERVICE_CI, "role": "affected"}]
+    old = svc.create_record({"record_type": "incident", "title": "old", "source": "monitoring",
+                             "external_id": "a", "ci_links": links}, author="monitoring")
+    new = svc.create_record({"record_type": "incident", "title": "new", "source": "monitoring",
+                             "external_id": "b", "ci_links": links}, author="monitoring")
+    with get_session() as s:  # make the order explicit, independent of the clock
+        rec = s.get(models.Record, old["uuid"])
+        rec.opened_at = rec.opened_at - timedelta(minutes=5)
+        s.commit()
+    survivor = run(incidents._yield_to_older_incident(new, SERVICE_CI))
+    assert survivor and survivor["uuid"] == old["uuid"]
+    assert svc.get_record(new["uuid"])["state"] == "cancelled"
+    assert run(incidents._yield_to_older_incident(old, SERVICE_CI)) is None  # the oldest stays
+    assert svc.get_record(old["uuid"])["state"] != "cancelled"
+
+
+def test_single_event_still_creates_exactly_one_incident(incidents, svc):
+    uuid = run(incidents.handle_outage_persisted(persisted()))
+    assert uuid and len(_open_monitoring(svc)) == 1 and incidents._ci_locks == {}

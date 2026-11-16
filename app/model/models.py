@@ -10,8 +10,11 @@ JournalEntry— append-only timeline: comments, work notes, state and field
               changes, links. Never updated or deleted → the audit trail.
 CiLink      — record ↔ configuration item (Entity Registry UUID). The display
               name/type are cached so the UI works while the registry is down.
+RecordTag   — indexed mirror of ``Record.tags`` for the SQL tag filter.
 RecordLink  — record ↔ record (parent/child, caused_by, implements, …).
 Attachment  — file metadata; bytes live on disk under the configured dir.
+IngestTombstone — "this external record already ended" memo for events that
+              overtake the event creating the record.
 Counter     — per-type sequence for human numbers (INC0000042); incremented
               under a row lock inside the create transaction.
 """
@@ -21,6 +24,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -45,6 +49,9 @@ class Record(_Base):
         # Idempotency key for records pushed in by a gateway/connector; native
         # records keep both NULL (NULLs never collide in a unique index).
         UniqueConstraint("source", "external_id", name="uq_itsm_source_ext"),
+        # The default list ("open records, newest first") and the open count of
+        # health()/stats: closed_at IS NULL ORDER BY opened_at DESC.
+        Index("ix_itsm_records_closed_opened", "closed_at", "opened_at"),
     )
 
     uuid = Column(String(36), primary_key=True)
@@ -120,6 +127,24 @@ class Record(_Base):
         }
 
 
+TAG_KEY_LENGTH = 128
+
+
+def tag_key(tag: str) -> str:
+    """A tag as stored in ``itsm_record_tags`` (bounded so it fits an index)."""
+    return tag[:TAG_KEY_LENGTH]
+
+
+class RecordTag(_Base):
+    """One row per (record, tag) — the indexed mirror of ``Record.tags`` so the
+    list filter ``?tag=`` runs in SQL (a JSON column cannot be indexed portably
+    across MariaDB and SQLite). ``Record.tags`` stays the source of truth."""
+    __tablename__ = "itsm_record_tags"
+
+    record_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), primary_key=True)
+    tag = Column(String(TAG_KEY_LENGTH), primary_key=True, index=True)
+
+
 class JournalEntry(_Base):
     __tablename__ = "itsm_journal"
 
@@ -174,12 +199,19 @@ class RecordLink(_Base):
     __tablename__ = "itsm_record_links"
     __table_args__ = (
         UniqueConstraint("from_uuid", "to_uuid", "relation", name="uq_itsm_record_link"),
+        # A→B "parent_of" and B→A "child_of" are the same link: pair_key is its
+        # direction-independent form, so the DB rejects the inverse duplicate
+        # two instances would otherwise both insert.
+        Index("uq_itsm_record_link_pair", "pair_key", unique=True),
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     from_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), nullable=False, index=True)
     to_uuid = Column(String(36), ForeignKey("itsm_records.uuid"), nullable=False, index=True)
     relation = Column(String(32), nullable=False)
+    # NULL only on rows of an instance older than 0.3.1 until the next boot
+    # backfills them (NULLs never collide in a unique index).
+    pair_key = Column(String(128), nullable=True)
     created_at = Column(DateTime, nullable=False, default=func.now())
 
     def to_dict(self) -> dict:
@@ -190,6 +222,15 @@ class RecordLink(_Base):
             "relation": self.relation,
             "created_at": _iso(self.created_at),
         }
+
+
+def record_link_pair_key(from_uuid: str, to_uuid: str, relation: str, inverse: str) -> str:
+    """Direction-independent identity of a record link: the pair ordered by
+    uuid plus the relation as seen from the lower uuid (``inverse`` is the
+    relation as seen from ``to_uuid``)."""
+    if from_uuid <= to_uuid:
+        return f"{from_uuid}:{to_uuid}:{relation}"
+    return f"{to_uuid}:{from_uuid}:{inverse}"
 
 
 class Attachment(_Base):
@@ -216,6 +257,20 @@ class Attachment(_Base):
             "uploaded_by": self.uploaded_by,
             "created_at": _iso(self.created_at),
         }
+
+
+class IngestTombstone(_Base):
+    """A fact about a pushed-in record that arrived *before* the record itself
+    (e.g. ``monitoring:outage_recovered`` ahead of ``outage_persisted``). The
+    ingest handler that later creates ``(source, external_id)`` consumes it.
+    Rows expire (``expires_at``) and are purged on the next write."""
+    __tablename__ = "itsm_ingest_tombstones"
+
+    source = Column(String(64), primary_key=True)
+    external_id = Column(String(255), primary_key=True)
+    data = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime, nullable=False, default=func.now())
+    expires_at = Column(DateTime, nullable=False, index=True)
 
 
 class Counter(_Base):

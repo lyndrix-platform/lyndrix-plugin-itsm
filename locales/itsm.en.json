@@ -55,6 +55,8 @@
     "incident_title": "{{name}}: unreachable since {{since}}",
     "incident_description": "Opened automatically from monitoring.\n\nMonitor: {{monitor_id}}\nConfiguration item: {{name}} ({{kind}}, {{ci_id}})\nHost: {{host}}\nDown since: {{since}} — reported {{persisted_at}} after {{duration}}\nRule: offline_minutes={{offline_minutes}}, severity={{severity}}, auto_resolve={{auto_resolve}}\nLast error: {{error}}",
     "outage_repeated": "Another outage reported: {{name}}, since {{since}}, duration {{duration}} (outage {{outage_id}}).",
+    "outage_duplicate_cancel": "Duplicate of {{number}}: another instance opened an incident for the same configuration item at the same time.",
+    "outage_duplicate_note": "Outage {{outage_id}} was reported twice at once; this incident was cancelled in favour of {{number}}.",
     "recovered_note": "Monitor back up at {{recovered_at}}, outage duration {{duration}}.",
     "resolution_notes": "Resolved automatically: monitor back up at {{recovered_at}}, outage duration {{duration}}.",
     "recovered_no_auto_resolve": "Monitor back up at {{recovered_at}}, outage duration {{duration}}. Not resolved automatically (auto_resolve is off) — please verify and resolve manually.",

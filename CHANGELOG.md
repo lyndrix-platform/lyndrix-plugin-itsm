@@ -4,6 +4,31 @@ All notable changes to this plugin are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow the
 manifest `version` and the matching git tag.
 
+## [0.4.0] - 2026-11-15
+
+Reliability audit 2026-11. Minimum core
+unchanged; no React source changed. New database objects are created idempotently under the bootstrap lock: table
+`itsm_record_tags` (backfilled in chunks), table `itsm_ingest_tombstones`, column and unique index
+`itsm_record_links.pair_key` (existing inverse duplicates are removed, the oldest row wins), index
+`(closed_at, opened_at)`.
+
+### Fixed
+- `health()` only reads a cached attachment-directory probe; the probe runs on its own thread, one at a time, so a hung
+  NFS mount no longer exhausts the shared thread pool. A probe running for more than 10 s is reported as
+  `attachment_dir_unresponsive` (IT-01).
+- `GET /records` filters, counts and pages in SQL; `limit` is capped at 1000 and `?tag=` uses an indexed mirror table.
+  The response shape is unchanged (IT-02).
+- A `monitoring:outage_recovered` that overtakes its `outage_persisted` is remembered for 24 h and closes the incident
+  as soon as it is created (IT-03).
+- Concurrent `monitoring:outage_persisted` events for one CI no longer open several incidents (MO-10): creation is
+  serialised per `ci_id` on an instance, and after the insert the oldest open monitoring incident of the CI survives
+  (a duplicate created by a peer instance is cancelled with a pointer to it, its outage is noted on the survivor).
+- Record links are unique per pair in the database; a concurrent duplicate link (records or CIs) is idempotent instead
+  of HTTP 500, and unlink removes every matching row (IT-04).
+- Fields changed along with a transition are journalled with old and new values, and `itsm:record_updated` is emitted,
+  so the assignment notification fires when the assignee is set while changing state (IT-05).
+- Creating a record uses one pooled DB connection at a time instead of two (IT-06).
+
 ## [0.3.0] - 2026-10-18
 
 Maintenance-windows contract (core `docs/plugins.md` → *Maintenance windows*,

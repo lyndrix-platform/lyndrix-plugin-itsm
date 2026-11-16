@@ -55,6 +55,8 @@
     "incident_title": "{{name}}: nicht erreichbar seit {{since}}",
     "incident_description": "Automatisch aus dem Monitoring angelegt.\n\nMonitor: {{monitor_id}}\nConfiguration Item: {{name}} ({{kind}}, {{ci_id}})\nHost: {{host}}\nAusfall seit: {{since}} — gemeldet {{persisted_at}} nach {{duration}}\nRegel: offline_minutes={{offline_minutes}}, severity={{severity}}, auto_resolve={{auto_resolve}}\nLetzter Fehler: {{error}}",
     "outage_repeated": "Erneuter Ausfall gemeldet: {{name}}, seit {{since}}, Dauer {{duration}} (Outage {{outage_id}}).",
+    "outage_duplicate_cancel": "Duplikat von {{number}}: eine andere Instanz hat gleichzeitig einen Incident für dasselbe Configuration Item eröffnet.",
+    "outage_duplicate_note": "Outage {{outage_id}} wurde gleichzeitig doppelt gemeldet; dieser Incident wurde zugunsten von {{number}} storniert.",
     "recovered_note": "Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}.",
     "resolution_notes": "Automatisch gelöst: Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}.",
     "recovered_no_auto_resolve": "Monitor wieder erreichbar um {{recovered_at}}, Ausfalldauer {{duration}}. Kein automatisches Lösen (auto_resolve ist aus) — bitte prüfen und manuell lösen.",

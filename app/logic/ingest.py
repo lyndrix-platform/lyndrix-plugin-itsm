@@ -255,6 +255,19 @@ class EventIngest:
 
         return await asyncio.to_thread(_tx)
 
+    async def _remember(self, external_id: str, data: dict, *, ttl_seconds: float) -> bool:
+        """Keep ``data`` for a record of ours that does not exist yet (an event
+        overtook the one that creates it) — see ``ItsmService.remember_ingest_event``."""
+        return await asyncio.to_thread(
+            self.service.remember_ingest_event, self.source, external_id, data,
+            ttl_seconds=ttl_seconds,
+        )
+
+    async def _take_remembered(self, external_id: str) -> dict | None:
+        return await asyncio.to_thread(
+            self.service.take_ingest_event, self.source, external_id
+        )
+
     def _is_open(self, record: dict) -> bool:
         return record.get("state") in self.service.open_state_names(self.record_type)
 

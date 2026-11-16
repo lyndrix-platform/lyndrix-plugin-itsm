@@ -30,18 +30,30 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from core.api import get_logger
 
 from ..model.database import ensure_tables, get_session, is_retryable, retry_write
-from ..model.models import Attachment, CiLink, Counter, JournalEntry, Record, RecordLink
+from ..model.models import (
+    Attachment,
+    CiLink,
+    Counter,
+    IngestTombstone,
+    JournalEntry,
+    Record,
+    RecordLink,
+    RecordTag,
+    record_link_pair_key,
+    tag_key,
+)
 from . import attachments as att
 from .catalog import (
     CI_LINK_ROLES,
@@ -57,11 +69,19 @@ log = get_logger("Plugin:ITSM:Service")
 
 SOURCE_ID = "itsm"
 CATALOG_RELOADED_TOPIC = "itsm:catalog_reloaded"
-# health() is polled by every dashboard: the attachment-dir probe (write test +
-# cluster marker) runs at most this often.
+# The attachment-dir probe (write test + cluster marker) is refreshed in the
+# background at this interval; health() only ever reads its cached result.
 STORAGE_CHECK_TTL = 60.0
+# A probe still running after this many seconds means the mount hangs (NFS /
+# share-manager down): health reports ``attachment_dir_unresponsive``.
+STORAGE_PROBE_STUCK_AFTER = 10.0
+# Upper bound a caller of storage_check() waits for a running probe.
+STORAGE_PROBE_WAIT = 5.0
 _PROBLEM_TEXT = {
     "attachment_dir_not_writable": "Attachment directory is not writable",
+    "attachment_dir_unresponsive": (
+        "Attachment directory does not respond (hung NFS/RWX mount?) — uploads and downloads will fail"
+    ),
     "attachment_dir_not_shared": (
         "Attachment directory is not shared with the other instances — mount it as an "
         "RWX/NFS volume, otherwise attachments uploaded elsewhere are missing here"
@@ -69,6 +89,8 @@ _PROBLEM_TEXT = {
     "catalog_dir_missing": "Configured catalog directory is missing on this instance — using the built-in catalog",
 }
 JOURNAL_USER_KINDS = ("comment", "work_note")
+# Hard cap of one list page — list_records never materialises more rows.
+MAX_PAGE_SIZE = 1000
 
 # Fields a PATCH may touch. state is changed only via transition(); identity
 # and gateway keys never change after create.
@@ -122,6 +144,17 @@ def _parse_dt(value) -> datetime | None:
     return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
+class _StorageProbe:
+    """One run of the attachment-dir probe on its own daemon thread."""
+
+    __slots__ = ("root", "started", "done")
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.started = time.monotonic()
+        self.done = threading.Event()
+
+
 class ItsmService:
     def __init__(self) -> None:
         self._ctx = None
@@ -138,6 +171,8 @@ class ItsmService:
         # Operator catalog_dir that does not exist on this instance (health → degraded).
         self.catalog_dir_missing: str | None = None
         self._storage_cache: tuple[float, dict] | None = None
+        self._probe: _StorageProbe | None = None  # the single in-flight (or last) probe
+        self._probe_lock = threading.Lock()
         self._status_message: str | None = None  # last degraded message sent via set_status
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
@@ -305,6 +340,14 @@ class ItsmService:
         s.add(entry)
         return entry
 
+    def _sync_tags(self, s, record_uuid: str, tags: list[str] | None, *, replace: bool) -> None:
+        """Mirror ``Record.tags`` into ``itsm_record_tags`` (SQL tag filter).
+        The record row must already be flushed (FK)."""
+        if replace:
+            s.execute(delete(RecordTag).where(RecordTag.record_uuid == record_uuid))
+        for key in sorted({tag_key(t) for t in tags or [] if t}):
+            s.add(RecordTag(record_uuid=record_uuid, tag=key))
+
     def _get(self, s, ref: str) -> Record | None:
         """Fetch by uuid or by human number (INC0000042)."""
         rec = s.get(Record, ref) if len(ref) == 36 else None
@@ -423,12 +466,20 @@ class ItsmService:
             raise ItsmError("source and external_id must be given together")
 
         def _tx() -> dict:
+            # Three short sessions one after the other — never two pooled
+            # connections at once: a burst of creates (hypervisor down → N
+            # outage incidents) must not need 2×N connections of the shared pool.
+            if source:
+                with get_session() as s:
+                    if s.execute(
+                        select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
+                    ).scalar_one_or_none():
+                        raise DuplicateRecord(f"Record {source}/{external_id} already exists")
+            # Own committed counter transaction; a number whose insert fails
+            # below is skipped (numbers are unique, not gap-free). A duplicate
+            # slipping in after the check above is caught by uq_itsm_source_ext.
+            number = self._allocate_number(rt)
             with get_session() as s:
-                if source and s.execute(
-                    select(Record.uuid).where(Record.source == source, Record.external_id == external_id)
-                ).scalar_one_or_none():
-                    raise DuplicateRecord(f"Record {source}/{external_id} already exists")
-                number = self._allocate_number(rt)
                 rec = Record(
                     uuid=str(uuid4()), number=number, record_type=rt.id,
                     subtype=fields.get("subtype"), category=fields.get("category"),
@@ -443,7 +494,8 @@ class ItsmService:
                     external_url=(data.get("external_url") or None),
                 )
                 s.add(rec)
-                s.flush()  # parent row first — CiLink/Journal FKs reference it
+                s.flush()  # parent row first — CiLink/Journal/Tag FKs reference it
+                self._sync_tags(s, rec.uuid, rec.tags, replace=False)
                 for link in ci_links:
                     s.add(CiLink(record_uuid=rec.uuid, **link))
                 self._journal(s, rec.uuid, "system", author, "created",
@@ -495,6 +547,52 @@ class ItsmService:
             ).scalar_one_or_none()
             return rec.to_dict() if rec else None
 
+    # ── Ingest tombstones (events that overtake the record they refer to) ────
+
+    def remember_ingest_event(self, source: str, external_id: str, data: dict,
+                              *, ttl_seconds: float) -> bool:
+        """Remember ``data`` for a record ``(source, external_id)`` that does
+        not exist yet. The first memo wins (a re-delivered event changes
+        nothing); expired memos are purged on the way. → True when stored."""
+        self._require_ready()
+        now = _now()
+
+        def _tx() -> bool:
+            with get_session() as s:
+                s.execute(delete(IngestTombstone).where(IngestTombstone.expires_at < now))
+                if s.get(IngestTombstone, (source, external_id)) is not None:
+                    s.commit()
+                    return False
+                s.add(IngestTombstone(source=source, external_id=external_id, data=dict(data),
+                                      created_at=now, expires_at=now + timedelta(seconds=ttl_seconds)))
+                s.commit()
+                return True
+
+        try:
+            return retry_write(_tx)
+        except IntegrityError:  # a peer instance stored the same memo first
+            return False
+
+    def take_ingest_event(self, source: str, external_id: str) -> dict | None:
+        """Consume the memo of ``(source, external_id)``: its data, or None when
+        there is none (or it expired). The DELETE decides — of several
+        concurrent takers exactly one gets it."""
+        self._require_ready()
+        now = _now()
+
+        def _tx() -> dict | None:
+            with get_session() as s:
+                row = s.get(IngestTombstone, (source, external_id))
+                if row is None:
+                    return None
+                data, expired = dict(row.data or {}), row.expires_at < now
+                res = s.execute(delete(IngestTombstone).where(
+                    IngestTombstone.source == source, IngestTombstone.external_id == external_id))
+                s.commit()
+                return data if res.rowcount == 1 and not expired else None
+
+        return retry_write(_tx)
+
     def find_open_for_ci(self, ci_id: str, *, record_type: str, source: str | None = None,
                          role: str = "affected") -> dict | None:
         """Most recent record of ``record_type`` in an *open* state that links
@@ -514,6 +612,25 @@ class ItsmService:
             rec = s.execute(stmt.order_by(Record.opened_at.desc()).limit(1)).scalars().first()
             return rec.to_dict() if rec else None
 
+    def list_open_for_ci(self, ci_id: str, *, record_type: str, source: str | None = None,
+                         role: str = "affected") -> list[dict]:
+        """Every open record that ``find_open_for_ci`` would consider, OLDEST
+        first (``opened_at``, then uuid) — a total order two instances agree on,
+        used to pick the survivor when a race created duplicates."""
+        self._require_ready()
+        states = self.open_state_names(record_type)
+        with get_session() as s:
+            stmt = (
+                select(Record)
+                .join(CiLink, CiLink.record_uuid == Record.uuid)
+                .where(CiLink.entity_uuid == ci_id, CiLink.role == role,
+                       Record.record_type == record_type, Record.state.in_(states))
+            )
+            if source:
+                stmt = stmt.where(Record.source == source)
+            rows = s.execute(stmt.order_by(Record.opened_at.asc(), Record.uuid.asc())).scalars().all()
+            return [r.to_dict() for r in rows]
+
     def list_records(
         self, *, record_type: str | None = None, state: str | None = None,
         priority: str | None = None, assignee: str | None = None,
@@ -521,31 +638,44 @@ class ItsmService:
         ci: str | None = None, q: str | None = None, include_closed: bool = False,
         limit: int = 200, offset: int = 0,
     ) -> dict:
+        """One page of records, newest first: ``{"total", "records"}``.
+
+        Filtering, counting and paging all happen in SQL — the table grows
+        with every monitoring outage, so no request may materialise more than
+        one page (``limit`` is clamped to ``MAX_PAGE_SIZE``). ``total`` is the
+        number of records matching the filters, independent of the page.
+        """
         self._require_ready()
+        limit = max(1, min(int(limit), MAX_PAGE_SIZE))
+        offset = max(0, int(offset))
+        conditions = []
+        if not include_closed:
+            conditions.append(Record.closed_at.is_(None))
+        if record_type:
+            conditions.append(Record.record_type == record_type)
+        if state:
+            conditions.append(Record.state == state)
+        if priority:
+            conditions.append(Record.priority == priority)
+        if assignee:
+            conditions.append(Record.assignee == assignee)
+        if assignment_group:
+            conditions.append(Record.assignment_group == assignment_group)
+        if ci:
+            conditions.append(Record.uuid.in_(select(CiLink.record_uuid).where(CiLink.entity_uuid == ci)))
+        if tag:
+            conditions.append(Record.uuid.in_(select(RecordTag.record_uuid).where(RecordTag.tag == tag_key(tag))))
+        if q and q.strip():
+            like = f"%{q.strip()}%"
+            conditions.append(or_(Record.number.like(like), Record.title.like(like)))
         with get_session() as s:
-            stmt = select(Record)
-            if not include_closed:
-                stmt = stmt.where(Record.closed_at.is_(None))
-            if record_type:
-                stmt = stmt.where(Record.record_type == record_type)
-            if state:
-                stmt = stmt.where(Record.state == state)
-            if priority:
-                stmt = stmt.where(Record.priority == priority)
-            if assignee:
-                stmt = stmt.where(Record.assignee == assignee)
-            if assignment_group:
-                stmt = stmt.where(Record.assignment_group == assignment_group)
-            if ci:
-                stmt = stmt.where(Record.uuid.in_(select(CiLink.record_uuid).where(CiLink.entity_uuid == ci)))
-            if q:
-                like = f"%{q.strip()}%"
-                stmt = stmt.where(or_(Record.number.like(like), Record.title.like(like)))
-            rows = s.execute(stmt.order_by(Record.opened_at.desc())).scalars().all()
-            if tag:  # JSON list → filter in Python (portable across MariaDB/SQLite)
-                rows = [r for r in rows if tag in (r.tags or [])]
-            total = len(rows)
-            rows = rows[offset: offset + limit]
+            total = s.execute(select(func.count()).select_from(Record).where(*conditions)).scalar_one()
+            rows = s.execute(
+                select(Record).where(*conditions)
+                # number as tie-breaker keeps pages stable for equal timestamps
+                .order_by(Record.opened_at.desc(), Record.number.desc())
+                .limit(limit).offset(offset)
+            ).scalars().all()
             uuids = [r.uuid for r in rows]
             ci_counts: dict[str, int] = {}
             if uuids:
@@ -554,7 +684,7 @@ class ItsmService:
                     .group_by(CiLink.record_uuid)
                 ).all():
                     ci_counts[ru] = n
-            return {"total": total, "records": [{**r.to_dict(), "ci_count": ci_counts.get(r.uuid, 0)} for r in rows]}
+            return {"total": int(total), "records": [{**r.to_dict(), "ci_count": ci_counts.get(r.uuid, 0)} for r in rows]}
 
     # ── Update / transition ──────────────────────────────────────────────────
 
@@ -612,6 +742,8 @@ class ItsmService:
                     rec.priority = new_prio
             if not diff:
                 return self._detail(s, rec), {}
+            if "tags" in diff:
+                self._sync_tags(s, rec.uuid, rec.tags, replace=True)
             self._journal(s, rec.uuid, "field_change", author, None, {"changes": diff})
             self._bump_version(s, rec, base_version)
             s.commit()
@@ -623,15 +755,19 @@ class ItsmService:
                    expected_version: int | None = None) -> dict:
         self._require_ready()
         fields = dict(fields or {})
-        detail, from_state = self._versioned_write(
+        detail, from_state, diff = self._versioned_write(
             lambda: self._transition_tx(ref, to_state, fields, author, note, expected_version),
             expected_version=expected_version,
         )
         log.info(f"ITSM: {detail['number']} {from_state} → {to_state} by {author}")
+        if diff:
+            # Fields set along with the transition are ordinary field changes:
+            # same event as a PATCH, so e.g. the assignment notification fires.
+            self._emit("itsm:record_updated", {"record": detail, "changes": diff})
         self._emit("itsm:state_changed", {"record": detail, "from_state": from_state, "to_state": to_state})
         return detail
 
-    def _transition_tx(self, ref, to_state, fields, author, note, expected_version) -> tuple[dict, str]:
+    def _transition_tx(self, ref, to_state, fields, author, note, expected_version) -> tuple[dict, str, dict]:
         with get_session() as s:
             rec = self._get(s, ref)
             if rec is None:
@@ -655,12 +791,23 @@ class ItsmService:
             core_fields = {k: v for k, v in fields.items() if k in ("assignee", "assignment_group", "category", "subtype", "description")}
             custom_in = {k: v for k, v in fields.items() if k not in core_fields}
             applied = self._validate_classification(rt, core_fields, partial=True)
+            # Old/new of everything the transition overwrites — journalled below
+            # in the same transaction, like a PATCH (an overwritten description
+            # must not vanish from the audit trail).
+            diff: dict[str, dict] = {}
             for k, v in applied.items():
-                setattr(rec, k, v)
+                old = getattr(rec, k)
+                if old != v:
+                    diff[k] = {"old": old, "new": v}
+                    setattr(rec, k, v)
             try:
                 custom = rt.validate_custom_fields(custom_in)
             except CatalogError as exc:
                 raise ItsmError(str(exc)) from exc
+            for k, v in custom.items():
+                old = (rec.custom_fields or {}).get(k)
+                if old != v:
+                    diff[f"custom_fields.{k}"] = {"old": old, "new": v}
             rec.custom_fields = {**(rec.custom_fields or {}), **custom}
 
             missing = []
@@ -684,12 +831,14 @@ class ItsmService:
             else:
                 rec.resolved_at = None
                 rec.closed_at = None
+            if diff:
+                self._journal(s, rec.uuid, "field_change", author, None, {"changes": diff})
             self._journal(s, rec.uuid, "state_change", author, note,
                           {"from": from_state, "to": to_state, "fields": sorted(fields)})
             self._bump_version(s, rec, base_version)
             s.commit()
             s.refresh(rec)
-            return self._detail(s, rec), from_state
+            return self._detail(s, rec), from_state, diff
 
     # ── Journal ──────────────────────────────────────────────────────────────
 
@@ -819,7 +968,16 @@ class ItsmService:
             s.add(CiLink(record_uuid=rec.uuid, **link))
             self._journal(s, rec.uuid, "link", author, None,
                           {"ci": entity_uuid, "role": link["role"], "display_name": display_name, "action": "added"})
-            s.commit()
+            try:
+                s.commit()
+            except IntegrityError:
+                # uq_itsm_ci_link: another request linked the same CI between
+                # our check and the insert — the link exists, which is what
+                # the caller asked for.
+                s.rollback()
+                rec = self._get(s, ref)
+                if rec is None:
+                    raise NotFound(f"Unknown record: {ref}") from None
             return self._detail(s, rec)
 
     def unlink_ci(self, ref: str, entity_uuid: str, role: str, *, author: str | None = None) -> dict:
@@ -838,6 +996,14 @@ class ItsmService:
             s.commit()
             return self._detail(s, rec)
 
+    @staticmethod
+    def _record_link_filter(a_uuid: str, b_uuid: str, relation: str, inverse: str):
+        """The link a→b ``relation`` in either stored direction."""
+        return or_(
+            (RecordLink.from_uuid == a_uuid) & (RecordLink.to_uuid == b_uuid) & (RecordLink.relation == relation),
+            (RecordLink.from_uuid == b_uuid) & (RecordLink.to_uuid == a_uuid) & (RecordLink.relation == inverse),
+        )
+
     def link_records(self, from_ref: str, to_ref: str, relation: str, *, author: str | None = None) -> dict:
         self._require_ready()
         if relation not in RECORD_LINK_RELATIONS:
@@ -850,15 +1016,23 @@ class ItsmService:
                 raise ItsmError("A record cannot link to itself")
             # Store one row for the pair: if the inverse already exists, that's the same link.
             inverse = RECORD_LINK_RELATIONS[relation]
-            existing = s.execute(select(RecordLink).where(or_(
-                (RecordLink.from_uuid == a.uuid) & (RecordLink.to_uuid == b.uuid) & (RecordLink.relation == relation),
-                (RecordLink.from_uuid == b.uuid) & (RecordLink.to_uuid == a.uuid) & (RecordLink.relation == inverse),
-            ))).scalar_one_or_none()
+            existing = s.execute(
+                select(RecordLink.id).where(self._record_link_filter(a.uuid, b.uuid, relation, inverse)).limit(1)
+            ).first()
             if existing is None:
-                s.add(RecordLink(from_uuid=a.uuid, to_uuid=b.uuid, relation=relation))
+                s.add(RecordLink(from_uuid=a.uuid, to_uuid=b.uuid, relation=relation,
+                                 pair_key=record_link_pair_key(a.uuid, b.uuid, relation, inverse)))
                 self._journal(s, a.uuid, "link", author, None, {"record": b.number, "relation": relation, "action": "added"})
                 self._journal(s, b.uuid, "link", author, None, {"record": a.number, "relation": inverse, "action": "added"})
-                s.commit()
+                try:
+                    s.commit()
+                except IntegrityError:
+                    # Lost the race against the same link (or its inverse, see
+                    # uq_itsm_record_link_pair) from another request: linked is linked.
+                    s.rollback()
+                    a = self._get(s, from_ref)
+                    if a is None:
+                        raise NotFound("Unknown record") from None
             return self._detail(s, a)
 
     def unlink_records(self, from_ref: str, to_ref: str, relation: str, *, author: str | None = None) -> dict:
@@ -868,13 +1042,15 @@ class ItsmService:
             a, b = self._get(s, from_ref), self._get(s, to_ref)
             if a is None or b is None:
                 raise NotFound("Unknown record")
-            link = s.execute(select(RecordLink).where(or_(
-                (RecordLink.from_uuid == a.uuid) & (RecordLink.to_uuid == b.uuid) & (RecordLink.relation == relation),
-                (RecordLink.from_uuid == b.uuid) & (RecordLink.to_uuid == a.uuid) & (RecordLink.relation == inverse),
-            ))).scalar_one_or_none()
-            if link is None:
+            # All matching rows: a pair duplicated before the unique pair key
+            # existed must still be removable in one call.
+            links = s.execute(
+                select(RecordLink).where(self._record_link_filter(a.uuid, b.uuid, relation, inverse))
+            ).scalars().all()
+            if not links:
                 raise NotFound("Unknown record link")
-            s.delete(link)
+            for link in links:
+                s.delete(link)
             self._journal(s, a.uuid, "link", author, None, {"record": b.number, "relation": relation, "action": "removed"})
             self._journal(s, b.uuid, "link", author, None, {"record": a.number, "relation": inverse, "action": "removed"})
             s.commit()
@@ -982,19 +1158,12 @@ class ItsmService:
                      if i.get("alive") and not i.get("is_self") and i.get("instance_id")]
         return mode, (str(me) if me else None), peers
 
-    def storage_check(self, *, force: bool = False) -> dict:
-        """Probe the attachment directory (cached for ``STORAGE_CHECK_TTL``).
-
-        Single mode: writable or not. Cluster mode: also refresh this
-        instance's marker and look for the markers of the other live instances;
-        ``shared`` is True when at least one is visible, False when peers are
-        alive but none is visible, None when there is no live peer to compare.
-        """
-        now = time.monotonic()
-        cached = self._storage_cache
-        if not force and cached and now - cached[0] < STORAGE_CHECK_TTL:
-            return cached[1]
-        root = self.attachment_dir
+    def _probe_storage(self, root: Path) -> dict:
+        """The blocking probe itself. Single mode: writable or not. Cluster
+        mode: also refresh this instance's marker and look for the markers of
+        the other live instances; ``shared`` is True when at least one is
+        visible, False when peers are alive but none is visible, None when
+        there is no live peer to compare."""
         mode, me, peers = self._cluster_view()
         info: dict = {"writable": att.dir_writable(root), "cluster_mode": mode}
         if mode == "cluster":
@@ -1006,12 +1175,91 @@ class ItsmService:
             visible = att.visible_markers(root, peers)
             info.update(peers=len(peers), peers_visible=len(visible),
                         shared=(bool(visible) if peers else None))
-        self._storage_cache = (now, info)
         return info
+
+    def _probe_in_flight(self) -> _StorageProbe | None:
+        """The running probe of the *current* attachment dir, if any."""
+        probe = self._probe
+        if probe is not None and not probe.done.is_set() and probe.root == self.attachment_dir:
+            return probe
+        return None
+
+    def start_storage_probe(self) -> _StorageProbe:
+        """Make sure a probe of the attachment dir is running — never blocks.
+
+        Single-flight: while a probe is in flight no second one is started, so
+        a hung mount (the syscalls never return) costs exactly one dedicated
+        daemon thread instead of one worker of the shared ``to_thread``
+        executor per caller. Only a changed ``attachment_dir`` supersedes a
+        running probe (its result is discarded) — otherwise moving the
+        directory off a dead mount could never clear the problem.
+        """
+        with self._probe_lock:
+            probe = self._probe_in_flight()
+            if probe is not None:
+                return probe
+            probe = _StorageProbe(self.attachment_dir)
+            self._probe = probe
+        threading.Thread(target=self._run_storage_probe, args=(probe,),
+                         name="itsm-storage-probe", daemon=True).start()
+        return probe
+
+    def _run_storage_probe(self, probe: _StorageProbe) -> None:
+        try:
+            info = self._probe_storage(probe.root)
+        except Exception as exc:  # never let the probe thread die silently
+            log.warning(f"ITSM: attachment storage probe failed — {exc}")
+            info = {"writable": False, "cluster_mode": "single", "error": str(exc)}
+        with self._probe_lock:
+            current = self._probe is probe
+            if current:
+                self._storage_cache = (time.monotonic(), info)
+        probe.done.set()
+        if current:
+            try:
+                self.sync_runtime_status()
+            except Exception as exc:
+                log.debug(f"ITSM: runtime status sync after probe failed — {exc}")
+
+    def storage_snapshot(self) -> dict:
+        """The last probe result — a pure read that never touches the disk.
+
+        ``{"unresponsive": True}`` while a probe has been running for longer
+        than ``STORAGE_PROBE_STUCK_AFTER``; ``{"pending": True}`` before the
+        first result. The background refresher (entrypoint) keeps the result
+        fresh; should it not be running, a result older than two intervals
+        triggers a (single-flight, non-blocking) probe from here.
+        """
+        now = time.monotonic()
+        probe = self._probe_in_flight()
+        if probe is not None and now - probe.started > STORAGE_PROBE_STUCK_AFTER:
+            return {"writable": None, "unresponsive": True,
+                    "probe_running_s": round(now - probe.started, 1)}
+        cached = self._storage_cache
+        if cached is None:
+            if probe is None:
+                self.start_storage_probe()
+            return {"writable": None, "pending": True}
+        if probe is None and now - cached[0] > 2 * STORAGE_CHECK_TTL:
+            self.start_storage_probe()
+        return cached[1]
+
+    def storage_check(self, *, force: bool = False, wait: float = STORAGE_PROBE_WAIT) -> dict:
+        """Probe result, refreshed when older than ``STORAGE_CHECK_TTL`` (or
+        ``force``). The probe runs on its own thread; this call waits at most
+        ``wait`` seconds for it and then returns :meth:`storage_snapshot`, so
+        a hung mount can hold the calling worker thread only briefly."""
+        cached = self._storage_cache
+        if not force and cached and time.monotonic() - cached[0] < STORAGE_CHECK_TTL:
+            return cached[1]
+        self.start_storage_probe().done.wait(wait)
+        return self.storage_snapshot()
 
     def problems(self, storage: dict) -> list[str]:
         out = []
-        if not storage.get("writable"):
+        if storage.get("unresponsive"):
+            out.append("attachment_dir_unresponsive")
+        elif storage.get("writable") is False:  # None = no result yet, not a problem
             out.append("attachment_dir_not_writable")
         if storage.get("shared") is False:
             out.append("attachment_dir_not_shared")
@@ -1021,8 +1269,10 @@ class ItsmService:
 
     def health_report(self) -> tuple[str, dict]:
         """``(status, details)`` for the plugin ``health()`` hook — one cheap
-        count plus the cached storage probe; also syncs the runtime status
-        banner (``degraded``, non-blocking) with the problems found."""
+        count plus the *cached* storage probe (never a disk access: a hung
+        mount must not block one worker thread per dashboard poll); also syncs
+        the runtime status banner (``degraded``, non-blocking) with the
+        problems found."""
         self._require_ready()
         with get_session() as s:
             open_count = s.execute(
@@ -1036,7 +1286,7 @@ class ItsmService:
         }
         if not loaded:
             return "error", {**details, "reason": "catalog_not_loaded"}
-        storage = self.storage_check()
+        storage = self.storage_snapshot()
         details["attachment_storage"] = storage
         if self.catalog_dir_missing:
             details["catalog_dir_missing"] = self.catalog_dir_missing
@@ -1051,7 +1301,7 @@ class ItsmService:
         non-blocking ``degraded`` banner while any exist, ``ready`` once they
         are gone. Only phase/message changes are sent."""
         if problems is None:
-            problems = self.problems(self.storage_check())
+            problems = self.problems(self.storage_snapshot())
         set_status = getattr(self._ctx, "set_status", None)
         if not callable(set_status):
             return

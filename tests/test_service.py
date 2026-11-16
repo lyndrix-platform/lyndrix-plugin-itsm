@@ -466,6 +466,7 @@ def test_cluster_storage_not_shared_reports_degraded(svc):
     from app.logic import attachments as att
 
     svc.set_context(_ClusterCtx(peers=("b",)))
+    svc.storage_check(force=True)  # health() itself only reads the cached probe
     status, details = svc.health_report()
     assert status == "degraded" and details["reason"] == "attachment_dir_not_shared"
     assert details["attachment_storage"]["shared"] is False
@@ -486,6 +487,7 @@ def test_cluster_storage_not_shared_reports_degraded(svc):
 
 def test_cluster_storage_without_live_peers_is_unknown_not_degraded(svc):
     svc.set_context(_ClusterCtx(peers=()))
+    svc.storage_check(force=True)
     status, details = svc.health_report()
     assert status == "ok" and details["attachment_storage"]["shared"] is None
 
@@ -501,11 +503,87 @@ def test_storage_check_is_cached(svc, monkeypatch):
         return real(path)
 
     monkeypatch.setattr(att, "dir_writable", _count)
-    svc.health_report()
+    svc.storage_check()
+    svc.storage_check()
     svc.health_report()
     assert calls["n"] == 1
     svc.storage_check(force=True)
     assert calls["n"] == 2
+
+
+def test_hung_attachment_dir_never_costs_more_than_one_probe_thread(svc, monkeypatch):
+    """IT-01: a mount that hangs must not block one worker per health poll."""
+    import threading
+    import time
+
+    from app.logic import attachments as att
+    from app.logic import service as service_mod
+
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def _hang(path):
+        calls["n"] += 1
+        release.wait(30)
+        return True
+
+    monkeypatch.setattr(att, "dir_writable", _hang)
+    monkeypatch.setattr(service_mod, "STORAGE_PROBE_STUCK_AFTER", 0.2)
+    svc.set_context(_ClusterCtx(peers=()))
+
+    def _probe_threads() -> int:
+        return sum(1 for t in threading.enumerate() if t.name == "itsm-storage-probe" and t.is_alive())
+
+    async def _poll():
+        return await asyncio.gather(*[asyncio.to_thread(svc.health_report) for _ in range(20)])
+
+    try:
+        start = time.monotonic()
+        first = asyncio.run(_poll())
+        assert time.monotonic() - start < 1.0
+        assert {status for status, _ in first} == {"ok"}  # no result yet is not a problem
+        assert first[0][1]["attachment_storage"] == {"writable": None, "pending": True}
+        time.sleep(0.3)
+        start = time.monotonic()
+        later = asyncio.run(_poll())
+        assert time.monotonic() - start < 1.0
+        assert {(status, d["reason"]) for status, d in later} == {("degraded", "attachment_dir_unresponsive")}
+        svc.start_storage_probe()
+        assert svc.storage_check(force=True, wait=0.05)["unresponsive"] is True
+        assert calls["n"] == 1 and _probe_threads() == 1
+        assert svc._ctx.statuses[-1][0] == "degraded"
+    finally:
+        release.set()
+    svc._probe.done.wait(5)
+    status, details = svc.health_report()
+    assert status == "ok" and details["attachment_storage"]["writable"] is True
+    assert svc._ctx.statuses[-1][0] == "ready"
+
+
+def test_changed_attachment_dir_supersedes_a_hung_probe(svc, monkeypatch, tmp_path):
+    """Moving the directory off a dead mount must clear the problem."""
+    import threading
+
+    from app.logic import attachments as att
+
+    release = threading.Event()
+    real = att.dir_writable
+    dead = svc.attachment_dir
+
+    def _writable(path):
+        if path == dead:
+            release.wait(30)
+        return real(path)
+
+    monkeypatch.setattr(att, "dir_writable", _writable)
+    try:
+        stuck = svc.start_storage_probe()
+        svc.apply_settings({"attachment_dir": str(tmp_path / "moved")})
+        assert svc.storage_check(force=True)["writable"] is True
+    finally:
+        release.set()
+    stuck.done.wait(5)
+    assert svc.storage_snapshot()["writable"] is True  # the stale probe's result was discarded
 
 
 def test_settings_apply_catalog_dir_and_report_missing(svc, tmp_path):
@@ -666,3 +744,231 @@ def test_health_report_is_one_cheap_count(svc):
     status, details = svc.health_report()
     assert status == "ok" and details["open"] == 1
     assert "open_by_type" not in details
+
+
+# ── IT-02: list in SQL ─────────────────────────────────────────────────────────
+
+def _statements(svc, fn):
+    """Run ``fn`` and return the SQL statements it executed."""
+    from sqlalchemy import event
+
+    from app.model import database
+
+    seen: list[str] = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        seen.append(statement)
+
+    engine = database.db_instance.engine
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        result = fn()
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+    return result, seen
+
+
+def test_list_records_pages_and_counts_in_sql(svc):
+    for i in range(7):
+        _inc(svc, title=f"rec {i}", tags=["prod"] if i % 2 else ["lab", "prod-eu"])
+    page, seen = _statements(svc, lambda: svc.list_records(limit=2, offset=2))
+    assert page["total"] == 7 and len(page["records"]) == 2
+    assert [r["title"] for r in page["records"]] == ["rec 4", "rec 3"]  # newest first
+    selects = [q for q in seen if "FROM itsm_records" in q]
+    assert len(selects) == 2  # one count, one page — never the whole table
+    assert any("count(" in q.lower() for q in selects)
+    assert any("LIMIT" in q and "OFFSET" in q for q in selects)
+
+    tagged, seen = _statements(svc, lambda: svc.list_records(tag="prod", limit=1))
+    assert tagged["total"] == 3 and len(tagged["records"]) == 1  # exact tag, not a substring
+    assert all("itsm_record_tags" in q for q in seen if "FROM itsm_records" in q)
+    assert svc.list_records(tag="pro")["total"] == 0
+
+
+def test_list_records_limit_is_clamped(svc, monkeypatch):
+    from app.logic import service as service_mod
+
+    monkeypatch.setattr(service_mod, "MAX_PAGE_SIZE", 3)
+    for i in range(5):
+        _inc(svc, title=f"rec {i}")
+    page = svc.list_records(limit=10_000)
+    assert page["total"] == 5 and len(page["records"]) == 3
+
+
+def test_tag_mirror_follows_updates_and_backfills_old_rows(svc):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    rec = _inc(svc, tags=["a", "b"])
+    svc.update_record(rec["uuid"], {"tags": ["b", "c"]}, author="m")
+    assert svc.list_records(tag="a")["total"] == 0
+    assert svc.list_records(tag="c")["total"] == 1
+
+    # Rows written before the mirror table existed (or by an older instance).
+    with database.db_instance.engine.begin() as conn:
+        conn.execute(text("DELETE FROM itsm_record_tags"))
+    assert svc.list_records(tag="b")["total"] == 0
+    database.ensure_tables()
+    database.ensure_tables()  # idempotent
+    assert svc.list_records(tag="b")["total"] == 1
+    names = {ix["name"] for ix in __import__("sqlalchemy").inspect(database.db_instance.engine).get_indexes("itsm_records")}
+    assert "ix_itsm_records_closed_opened" in names
+
+
+# ── IT-04: link races ──────────────────────────────────────────────────────────
+
+def _raw_link(a: str, b: str, relation: str, pair_key=None) -> None:
+    from sqlalchemy import text
+
+    from app.model import database
+
+    with database.db_instance.engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO itsm_record_links (from_uuid, to_uuid, relation, pair_key, created_at) "
+            "VALUES (:a, :b, :r, :k, CURRENT_TIMESTAMP)"), {"a": a, "b": b, "r": relation, "k": pair_key})
+
+
+def test_inverse_record_link_is_rejected_by_the_db_and_counts_as_linked(svc, monkeypatch):
+    """Two instances link A→B parent_of and B→A child_of at the same time."""
+    from sqlalchemy.exc import IntegrityError
+
+    from app.model.models import record_link_pair_key
+
+    a, b = _inc(svc), _inc(svc, title="child")
+    svc.link_records(a["uuid"], b["uuid"], "parent_of", author="m")
+    with pytest.raises(IntegrityError):  # the pair key closes the gap of (from, to, relation)
+        _raw_link(b["uuid"], a["uuid"], "child_of",
+                  record_link_pair_key(b["uuid"], a["uuid"], "child_of", "parent_of"))
+
+    # The loser's existence check saw nothing; its insert hits the unique key.
+    svc.unlink_records(a["uuid"], b["uuid"], "parent_of")
+    real_filter = svc._record_link_filter
+    state = {"first": True}
+
+    def _peer_inserts_after_check(*args):
+        if state.pop("first", False):
+            _raw_link(a["uuid"], b["uuid"], "parent_of",
+                      record_link_pair_key(a["uuid"], b["uuid"], "parent_of", "child_of"))
+            from sqlalchemy import false
+            return false()
+        return real_filter(*args)
+
+    monkeypatch.setattr(svc, "_record_link_filter", _peer_inserts_after_check)
+    detail = svc.link_records(b["uuid"], a["uuid"], "child_of", author="m")  # no 500
+    assert [lk["relation_from_here"] for lk in detail["links"]] == ["child_of"]
+
+
+def test_legacy_inverse_duplicates_are_removable_and_deduped_on_boot(svc):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    a, b = _inc(svc), _inc(svc, title="child")
+    # Rows as an instance before the pair key could leave them behind.
+    _raw_link(a["uuid"], b["uuid"], "parent_of")
+    _raw_link(b["uuid"], a["uuid"], "child_of")
+    assert len(svc.unlink_records(a["uuid"], b["uuid"], "parent_of")["links"]) == 0  # was a 500
+
+    _raw_link(a["uuid"], b["uuid"], "parent_of")
+    _raw_link(b["uuid"], a["uuid"], "child_of")
+    database.ensure_tables()
+    database.ensure_tables()
+    with database.db_instance.engine.begin() as conn:
+        rows = conn.execute(text("SELECT from_uuid, pair_key FROM itsm_record_links")).all()
+    assert len(rows) == 1 and rows[0][0] == a["uuid"] and rows[0][1]  # oldest kept, keyed
+    assert len(svc.get_record(a["uuid"])["links"]) == 1
+
+
+def test_concurrent_ci_link_is_idempotent(svc, monkeypatch):
+    from sqlalchemy import text
+
+    from app.model import database
+
+    rec = _inc(svc)
+    ci = "99999999-9999-9999-9999-999999999999"
+    real = svc._check_ci_links
+
+    def _peer_links_first(links):
+        with database.db_instance.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO itsm_ci_links (record_uuid, entity_uuid, role, created_at) "
+                "VALUES (:r, :c, 'affected', CURRENT_TIMESTAMP)"), {"r": rec["uuid"], "c": ci})
+        return real(links)
+
+    monkeypatch.setattr(svc, "_check_ci_links", _peer_links_first)
+    # Hide the peer's row from the existence check, as a concurrent transaction would.
+    from app.logic import service as service_mod
+    real_select = service_mod.select
+    detail = None
+
+    def _select(*entities):
+        stmt = real_select(*entities)
+        if entities and entities[0] is service_mod.CiLink and detail is None:
+            return stmt.where(service_mod.CiLink.id < 0)
+        return stmt
+
+    monkeypatch.setattr(service_mod, "select", _select)
+    try:
+        svc.link_ci(rec["uuid"], ci, "affected", author="m")  # no IntegrityError → no 500
+    finally:
+        monkeypatch.setattr(service_mod, "select", real_select)
+    assert [c["entity_uuid"] for c in svc.get_record(rec["uuid"])["ci_links"]] == [ci]
+
+
+# ── IT-05: fields changed by a transition are audited ──────────────────────────
+
+def test_transition_journals_old_and_new_values_and_announces_the_change(svc):
+    rec = _inc(svc, description="original text")
+    svc._ctx.events.clear()
+    out = svc.transition(rec["uuid"], "in_progress", author="m",
+                         fields={"assignee": "anna", "description": "rewritten"})
+    change = [j for j in out["journal"] if j["kind"] == "field_change"]
+    assert len(change) == 1 and change[0]["author"] == "m"
+    assert change[0]["data"]["changes"] == {
+        "assignee": {"old": None, "new": "anna"},
+        "description": {"old": "original text", "new": "rewritten"},
+    }
+    assert [j["kind"] for j in out["journal"]][-2:] == ["field_change", "state_change"]
+    assert svc._ctx.topics() == ["itsm:record_updated", "itsm:state_changed"]
+    updated = svc._ctx.payloads("itsm:record_updated")[0]
+    assert updated["changes"]["assignee"] == {"old": None, "new": "anna"}  # → record_assigned notification
+    assert updated["record"]["state"] == "in_progress"
+
+    # Same values again / no fields: nothing to journal, no update event.
+    svc._ctx.events.clear()
+    out = svc.transition(rec["uuid"], "resolved", author="m",
+                         fields={"assignee": "anna", "resolution_code": "fixed", "resolution_notes": "done"})
+    last_change = [j for j in out["journal"] if j["kind"] == "field_change"][-1]
+    assert set(last_change["data"]["changes"]) == {"custom_fields.resolution_code", "custom_fields.resolution_notes"}
+
+
+# ── IT-06: one DB connection per create ────────────────────────────────────────
+
+def test_create_never_holds_two_sessions_at_once(svc, monkeypatch):
+    from contextlib import contextmanager
+
+    from app.logic import service as service_mod
+
+    real = service_mod.get_session
+    depth = {"now": 0, "max": 0}
+
+    @contextmanager
+    def _counting():
+        with real() as s:
+            depth["now"] += 1
+            depth["max"] = max(depth["max"], depth["now"])
+            try:
+                yield s
+            finally:
+                depth["now"] -= 1
+
+    monkeypatch.setattr(service_mod, "get_session", _counting)
+    rec = svc.create_record({"record_type": "incident", "title": "pushed", "source": "gw",
+                             "external_id": "X-1"}, author="m")
+    assert rec["number"] == "INC0000001" and depth["max"] == 1
+    with pytest.raises(service_mod.DuplicateRecord):
+        svc.create_record({"record_type": "incident", "title": "again", "source": "gw",
+                           "external_id": "X-1"}, author="m")
+    assert _inc(svc)["number"] == "INC0000002"  # the rejected duplicate consumed no number
+    assert depth["max"] == 1
