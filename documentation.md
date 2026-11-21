@@ -42,13 +42,20 @@ app/ui/react/                # React-UI (Bundle → app/ui/static/ui_bundle.js)
 | `itsm_records` | ein Datensatz je Zeile: `uuid` (PK), `number` (`INC0000042`, eindeutig), `record_type`, `subtype`, `category`, `title`, `description`, `state`, `impact`, `urgency`, `priority` (abgeleitet), `assignment_group`, `assignee`, `requester`, `created_by`, `custom_fields` (JSON), `tags` (JSON), `opened_at`/`resolved_at`/`closed_at`/`due_at`, `version` (optimistisches Sperren), Gateway-Felder `source`/`external_id`/`external_url`/`sync_state`/`sync_error` |
 | `itsm_journal` | append-only Verlauf: `comment`, `work_note`, `state_change`, `field_change`, `link`, `attachment`, `system` — jede Änderung hinterlässt einen Eintrag (Audit-Trail) |
 | `itsm_ci_links` | Datensatz ↔ Configuration Item (UUID aus der Entity Registry) mit Rolle `affected` / `caused_by` / `changed` / `related`; Anzeigename/Typ sind gecacht, damit die UI auch ohne Registry funktioniert |
-| `itsm_record_links` | Datensatz ↔ Datensatz (`parent_of`, `caused_by`, `implements`, `duplicate_of`, `related_to` + Inverse) |
+| `itsm_record_links` | Datensatz ↔ Datensatz (`parent_of`, `caused_by`, `implements`, `duplicate_of`, `related_to` + Inverse). Seit 0.4.0 eindeutig je Paar über `pair_key` (DB-seitig; bestehende Inverse-Duplikate werden bei der Migration entfernt, die älteste Zeile bleibt) |
+| `itsm_record_tags` | Seit 0.4.0 indizierter Spiegel von `itsm_records.tags` (ein Eintrag je Tag); `?tag=` filtert darüber. Wird beim ersten Start in Blöcken nachgefüllt |
+| `itsm_ingest_tombstones` | Seit 0.4.0 kurzlebige Merkzettel für Bus-Events, die ihr Gegenstück überholt haben (z. B. `outage_recovered` vor `outage_persisted`, 24 h Lebensdauer) |
 | `itsm_attachments` | Metadaten; die Bytes liegen unter `<attachment_dir>/<record uuid>/<attachment uuid>` |
 | `itsm_counters` | Nummernkreis je Typ, inkrementiert unter Zeilensperre in derselben Transaktion wie das Anlegen |
 
 ### Regeln, die der Service erzwingt
 
-- **Übergänge** nur entlang `transitions` des Katalogs → sonst HTTP 409.
+- **Übergänge** nur entlang `transitions` des Katalogs → sonst HTTP 409. Felder, die zusammen mit
+  einem Übergang geändert werden, landen mit altem und neuem Wert im Journal (`field_change`) und
+  lösen `itsm:record_updated` aus (seit 0.4.0; so greift die Zuweisungs-Benachrichtigung auch beim
+  Setzen des Bearbeiters während eines Statuswechsels).
+- **Verknüpfungen** sind je Paar eindeutig; ein gleichzeitig doppelt angelegter Link (Datensätze
+  oder CIs) ist idempotent statt HTTP 500, `DELETE` entfernt alle passenden Zeilen.
 - **Pflichtfelder** eines Zielstatus (`requires`) müssen vorhanden sein — entweder bereits am
   Datensatz oder im `fields`-Teil des Übergangs → sonst HTTP 400 mit Liste der fehlenden Felder.
 - **Priorität** wird aus `impact × urgency` über die Matrix abgeleitet und bei Änderung
@@ -122,7 +129,7 @@ Basis: `/api/plugins/lyndrix.plugin.itsm/`. Rechte: `plugin:lyndrix.plugin.itsm:
 
 | Methode | Pfad | Zweck |
 |---|---|---|
-| `GET` | `/records?type=&state=&priority=&assignee=&group=&tag=&ci=&q=&include_closed=&limit=&offset=` | Liste (geschlossene standardmäßig ausgeblendet) |
+| `GET` | `/records?type=&state=&priority=&assignee=&group=&tag=&ci=&q=&include_closed=&limit=&offset=` | Liste (geschlossene standardmäßig ausgeblendet). Filter, Zählung und Paging laufen seit 0.4.0 in SQL; `limit` ist auf 1000 gedeckelt, die Antwortform ist unverändert |
 | `POST` | `/records` | anlegen → `201 {record}` |
 | `GET` | `/records/{ref}` | Detail inkl. `allowed_transitions`, `journal`, `ci_links`, `links`, `attachments` |
 | `PATCH` | `/records/{ref}` | Felder ändern; optional `version` |
@@ -223,6 +230,11 @@ So entsteht der Incident:
 | CI-Links | `ci_id` als `affected`, `host_ci_id` als `related` — Namen/Typen aus der Entity Registry; ohne Registry (oder wenn sie das CI noch nicht kennt) rohe UUID-Links |
 | `created_by` / `requester` | `monitoring` |
 
+**Parallele Events.** Mehrere `outage_persisted` für dasselbe CI werden je Instanz pro `ci_id`
+serialisiert. Hat eine andere Instanz gleichzeitig ebenfalls einen Incident angelegt, überlebt der
+älteste offene Monitoring-Incident des CI; das Duplikat wird mit Verweis auf ihn storniert und der
+Ausfall als Notiz am Überlebenden vermerkt (seit 0.4.0).
+
 **Dedupe.** (1) Je Ausfall: existiert `(monitoring, outage_id)` schon, passiert nichts — auch
 wenn eine andere Cluster-Instanz den Datensatz zwischen Prüfung und Einfügen angelegt hat
 (`UNIQUE(source, external_id)`, der Datensatz des Gewinners gilt). (2) Je CI: hat das CI bereits
@@ -241,6 +253,8 @@ Incident über `outage_id`:
 - Übergang laut Katalog nicht erlaubt (z. B. aus `on_hold`) → Kommentar, Status bleibt.
 - Gleichzeitige Änderung (Versionskonflikt) → einmal neu lesen und wiederholen; hat inzwischen
   jemand gelöst oder geschlossen, passiert nichts mehr; sonst Log-Eintrag.
+- Überholt `outage_recovered` sein `outage_persisted` (Incident existiert noch nicht), merkt sich
+  das Plugin das Ende 24 h lang und schließt den Incident direkt nach dem Anlegen (seit 0.4.0).
 - Bereits `resolved`/`closed`/`cancelled` → nichts. Unbekannte `outage_id` → nichts, außer das CI
   hat einen offenen Monitoring-Incident mit Arbeitsnotiz zu diesem Ausfall (Dedupe 2) — dann
   wird auch das Ende dort notiert.
